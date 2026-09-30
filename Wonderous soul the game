@@ -6,10 +6,11 @@ Mothwing-style dash (ability gate), Soul from hits + hold-to-Focus heal,
 Geo currency, benches (rest / respawn), death "shade" you retrieve by striking it,
 connected rooms, patrol/flying enemies, and a boss.
 """
-import sys, math, random
+import sys, math, random, json, os
 import pygame
 
 W, H, T = 960, 544, 32
+SAVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wonderous_soul_save.json")
 GRAV, MAXFALL, NAIL = 2200, 900, 5
 
 
@@ -22,7 +23,7 @@ BOSS_MSG = {"boss": "The Husk Brute crumbles... the way east opens.",
             "weaver": "The Crystal Weaver shatters... the way forward opens.",
             "warden": "The Warden falls."}
 ICON = {"cloak": (120, 220, 255), "wings": (255, 240, 150), "claw": (255, 140, 120),
-        "mask": (240, 240, 250), "geocache": (240, 200, 90)}
+        "mask": (240, 240, 250), "geocache": (240, 200, 90), "charm": (255, 170, 230)}
 ITEM_MSG = {"cloak": "Mothwing Cloak acquired!  Press C / Shift to dash.",
             "wings": "Monarch Wings acquired!  Press jump again in mid-air.",
             "claw": "Mantis Claw acquired!  Press toward a wall to cling, jump to leap off.",
@@ -82,7 +83,8 @@ ROOMS = [
     mkroom("Fungal Gully", 70, plats=[(10, 12, 5), (22, 10, 6), (34, 12, 4), (48, 9, 5)], benches=[(4, 14)],
            npcs=[npc("Sly the Merchant", "merchant", 9, 14, [
                      "Geo for goods, friend. Sly's prices are fair. Mostly."],
-                     shop=[("Mask Shard", 100, "mask", 2), ("Nail Sharpening", 150, "nail", 3)]),
+                     shop=[("Mask Shard", 100, "mask", 2), ("Nail Sharpening", 150, "nail", 3),
+                           ("Charm: Greed", 90, "charm:greed", 1)]),
                  npc("Wren the Hunter", "hunter", 30, 14, [
                      "You felled the Husk Brute? Good. It guarded this passage for an age.",
                      "East, the vines grow thick. Some ledges are too high to reach... unless you have wings.",
@@ -124,7 +126,8 @@ ROOMS = [
            items=[("geocache", 21, 14)], doors=[door(2, 14, 3, 66, 14)],
            npcs=[npc("Grim", "merchant", 13, 14, [
                "Few find this cellar. Care to buy something rare?"],
-               shop=[("Quick Focus", 120, "focus", 1), ("Soul Catcher", 150, "soul", 2)])]),
+               shop=[("Quick Focus", 120, "focus", 1), ("Soul Catcher", 150, "soul", 2),
+                     ("Charm: Quick Slash", 130, "charm:quick_slash", 1)])]),
     # 9
     mkroom("Crystal Peak", 80, plats=[(10, 12, 4), (18, 10, 4), (26, 8, 4), (34, 6, 5), (44, 8, 4),
                                        (52, 10, 4), (60, 12, 4), (68, 11, 5)],
@@ -147,7 +150,7 @@ ROOMS = [
                    ("hopper", 50, 14), ("spitter", 73, 14), ("crawl", 84, 14), ("ghost", 80, 6),
                    ("spitter", 12, 14)]),
     # 12
-    mkroom("Warden's Sanctum", 38, plats=[(6, 11, 4), (28, 11, 4)], right=False, benches=[(3, 14)],
+    mkroom("Warden's Sanctum", 38, plats=[(6, 11, 4), (28, 11, 4)], benches=[(3, 14)], gates=[(37, 11, 1, 4, (12, 0))],
            spawns=[("warden", 26, 14)]),
     # 13
     mkroom("Crystal Vault", 24, left=False, right=False, benches=[(6, 14)],
@@ -161,8 +164,117 @@ LINKS = {(0, "R"): 1, (1, "L"): 0, (1, "R"): 2, (2, "L"): 1, (2, "R"): 3, (3, "L
          (9, "R"): 10, (10, "L"): 9, (10, "R"): 11, (11, "L"): 10, (11, "R"): 12, (12, "L"): 11}
 MAP_POS = [(0, 1), (1, 1), (2, 1), (3, 1), (3, 0), (4, 1), (5, 1), (6, 1), (3, 2), (7, 1), (8, 1),
            (9, 1), (10, 1), (7, 0)]
+CHARMS = {
+    "heavy_nail": dict(name="Heavy Nail", cost=2, desc="Your nail strikes hit much harder."),
+    "quick_slash": dict(name="Quick Slash", cost=1, desc="Swing your nail far faster."),
+    "soul_catch": dict(name="Soul Catcher", cost=1, desc="Gain extra Soul with every hit."),
+    "fragile_heart": dict(name="Fragile Heart", cost=2, desc="+2 max health while equipped."),
+    "swift_dash": dict(name="Swift Dash", cost=1, desc="Dash longer and recharge faster."),
+    "long_nail": dict(name="Long Nail", cost=1, desc="Extends the reach of your nail."),
+    "wind_stride": dict(name="Wind Stride", cost=1, desc="Run faster."),
+    "quick_focus": dict(name="Focused Mind", cost=2, desc="Heal with Focus in under half a second."),
+    "greed": dict(name="Greed", cost=1, desc="Enemies drop 50% more Geo."),
+    "stone_skin": dict(name="Stone Skin", cost=2, desc="Stay invulnerable much longer after a hit."),
+}
+ROOM_DEPTH = {}
+GEN_CHARMS = []
+REGIONS = [
+    ("Ashen Caverns", (255, 110, 50), ["crawl", "hopper", "bat", "spitter", "tank"], "boss", 12),
+    ("Glowmire Swamp", (60, 255, 150), ["hopper", "spitter", "fly", "ghost", "crawl"], "weaver", 14),
+    ("Bone Ruins", (225, 225, 200), ["tank", "bat", "ghost", "spitter", "hopper"], "warden", 16),
+    ("Void Reach", (150, 90, 255), ["ghost", "bat", "tank", "fly", "hopper", "spitter"], "warden", 18),
+]
+LORE = ["The deeper you go, the quieter the bugs become.",
+        "I lost my lantern here. Or perhaps it lost me.",
+        "Every region ends in a guardian. Rest before you face it.",
+        "The Warden was only the first gate.",
+        "Geo means nothing down here, yet I cannot stop counting it.",
+        "Hollow things hum when a true knight passes.",
+        "Mind the spikes. They were not always so hungry.",
+        "Some say the Void Reach has no bottom.",
+        "Keep your Soul high. A quick heal saves a long walk.",
+        "I can hear something vast breathing below the stone."]
+NPC_NAMES = ["Drifter", "Lost Pilgrim", "Old Bug", "Ashen Hermit", "Mossback", "Faded Scout"]
+
+
+def gen_room(rng, rname, ri, k, pool, tint, gid):
+    w = rng.randint(60, 100)
+    kind = rng.choice(("hops", "pits", "gauntlet", "pillars"))
+    plats, pits, spikes, blocks = [], [], [], []
+    x = 12
+    if kind == "hops":
+        row = 12
+        while x < w - 14:
+            n = rng.randint(3, 6); plats.append((x, row, n)); x += n + rng.randint(2, 4)
+            row = max(5, min(12, row + rng.choice((-2, -1, 0, 1, 2))))
+    elif kind == "pits":
+        while x < w - 20:
+            pw = rng.randint(4, 7); pits.append((x, x + pw - 1))
+            if pw >= 6 and rng.random() < 0.6: plats.append((x + pw // 2 - 1, 12, 2))
+            x += pw + rng.randint(7, 11)
+    elif kind == "gauntlet":
+        while x < w - 16:
+            sw = rng.randint(2, 3); spikes += [(x + i, 14) for i in range(sw)]
+            x += sw + rng.randint(6, 10)
+    else:
+        while x < w - 14:
+            h = rng.randint(2, 5); blocks.append((x, 15 - h, 2, h)); x += 2 + rng.randint(6, 10)
+    bad = set()
+    for a, b in pits: bad |= set(range(a - 1, b + 2))
+    for bx, by, bw, bh in blocks: bad |= set(range(bx - 1, bx + bw + 1))
+    for sx, sy in spikes: bad |= {sx - 1, sx, sx + 1}
+    cols = [c for c in range(9, w - 9) if c not in bad]
+    spawns = []
+    for _ in range(w // 10 + ri + (3 if kind == "gauntlet" else 0)):
+        kd, c = rng.choice(pool), rng.choice(cols)
+        if kd in ("fly", "ghost"): spawns.append((kd, c, rng.randint(2, 4)))
+        elif kd == "bat": spawns.append((kd, c, 1))
+        else: spawns.append((kd, c, 14))
+    npcs = []
+    if k % 5 == 2:
+        npcs.append(npc(rng.choice(NPC_NAMES), rng.choice(("elder", "hunter", "child", "hermit")), w - 7, 14,
+                        [rng.choice(LORE), rng.choice(LORE)]))
+    if k % 7 == 4:
+        npcs.append(npc("Wandering Trader", "merchant", 7, 14, ["Rare wares from the deep. Take a look."],
+                        shop=[("Mask Shard", 100, "mask", 2), ("Nail Sharpening", 150, "nail", 3)]))
+    items = []
+    if rng.random() < 0.3: items.append(("geocache%d" % gid, rng.choice(cols), 14))
+    if k % 9 == 6: items.append(("mask%d" % gid, rng.choice(cols), 14))
+    if k in (5, 9) and GEN_CHARMS: items.append(("charm:" + GEN_CHARMS.pop(), rng.choice(cols), 14))
+    room = mkroom("%s %d" % (rname, k + 1), w, plats=plats, pits=pits, spikes=spikes, blocks=blocks,
+                  benches=[(4, 14)] if k % 3 == 0 else [], spawns=spawns, items=items, npcs=npcs)
+    room["tint"] = tint
+    return room
+
+
+def gen_boss_room(rname, tint, bkind, gid, is_last):
+    spawn = {"boss": ("boss", 22, 12), "weaver": ("weaver", 18, 5), "warden": ("warden", 26, 14)}[bkind]
+    room = mkroom(rname + " Guardian", 38, plats=[(6, 11, 4), (28, 11, 4)], right=not is_last,
+                  benches=[(3, 14)], gates=[] if is_last else [(37, 11, 1, 4, (gid, 0))], spawns=[spawn])
+    room["tint"] = tint
+    return room
+
+
+def gen_world(seed=1234):
+    rng = random.Random(seed)
+    prev, final = 12, None
+    GEN_CHARMS[:] = sorted(c for c in CHARMS if c not in ("greed", "quick_slash")); rng.shuffle(GEN_CHARMS)
+    for ri, (rname, tint, pool, bkind, count) in enumerate(REGIONS):
+        for k in range(count):
+            gid = len(ROOMS)
+            ROOM_DEPTH[gid] = ri + 1
+            last = k == count - 1
+            ROOMS.append(gen_boss_room(rname, tint, bkind, gid, ri == len(REGIONS) - 1) if last
+                         else gen_room(rng, rname, ri, k, pool, tint, gid))
+            MAP_POS.append((k, 3 + ri))
+            LINKS[(prev, "R")] = gid; LINKS[(gid, "L")] = prev; prev = gid
+            if last: final = (gid, 0)
+    return final
+
+
+GEN_FINAL = gen_world()
 BOSS_IDS = {(i, n) for i, r in enumerate(ROOMS) for n, sp in enumerate(r["spawns"]) if sp[0] in BOSSES}
-FINAL_ID = (12, 0)
+FINAL_ID = GEN_FINAL
 
 
 def solids(room, r):
@@ -226,6 +338,9 @@ class Enemy(Body):
 
     def __init__(s, kind, cx, cy, eid):
         w, h, s.hp, s.dmg, s.geo = Enemy.STATS[kind]
+        dep = ROOM_DEPTH.get(eid[0], 0)
+        s.hp = int(s.hp * (1 + 0.35 * dep)); s.geo = int(s.geo * (1 + 0.3 * dep))
+        if dep >= 3 and kind not in BOSSES: s.dmg = 2
         s.maxhp = s.hp
         super().__init__(cx * T, cy * T if kind in FLYERS else (cy + 1) * T - h, w, h)
         s.kind, s.id, s.flash, s.stun = kind, eid, 0, 0
@@ -895,14 +1010,17 @@ class Game:
         s.state = "title"
         s.art, s.props = make_art(), {}
 
-    def start(s):
+    def start(s, load=False):
         s.p = Player()
         s.dead, s.taken, s.shade, s.shots = set(), set(), None, []
         s.spawn = (0, 4, 14)
         s.visited, s.bought, s.nail_lvl, s.focus_lvl, s.soul_lvl = set(), {}, 0, 0, 0
         s.show_map, s.talk, s.area_t = False, None, 0
+        s.charms_owned, s.equipped, s.notches = set(), [], 4
+        s.ch_sel, s.show_charms, s.ch_msg, s.ch_t = 0, False, "", 0
         s.shake = s.note_t = s.timer = s.cam = 0
         s.note = ""
+        if load: s.apply_save()
         s.respawn()
         s.state = "play"
 
@@ -915,6 +1033,63 @@ class Game:
         s.build_solids(); s.visited.add(i); s.p.cape = None
         s.en = [Enemy(k, x, y, (i, n)) for n, (k, x, y) in enumerate(s.room["spawns"])
                 if (i, n) not in s.dead]
+
+    def eq(s, key):
+        return key in s.equipped
+
+    def notch_used(s):
+        return sum(CHARMS[k]["cost"] for k in s.equipped)
+
+    def focus_time(s):
+        ft = 0.65 if s.focus_lvl else 1.0
+        return min(ft, 0.45) if s.eq("quick_focus") else ft
+
+    def toggle_charm(s, k):
+        p = s.p
+        if k in s.equipped:
+            s.equipped.remove(k)
+            if k == "fragile_heart": p.maxhp -= 2; p.hp = min(p.hp, p.maxhp)
+        elif s.notch_used() + CHARMS[k]["cost"] <= s.notches:
+            s.equipped.append(k)
+            if k == "fragile_heart": p.maxhp += 2; p.hp += 2
+        else:
+            s.ch_msg, s.ch_t = "Not enough charm notches.", 90
+
+    def charm_input(s, pressed):
+        s.ch_t = max(0, s.ch_t - 1)
+        own = [k for k in CHARMS if k in s.charms_owned]
+        if not own: return
+        s.ch_sel %= len(own)
+        if pressed & {pygame.K_d, pygame.K_RIGHT}: s.ch_sel = (s.ch_sel + 1) % len(own)
+        if pressed & {pygame.K_a, pygame.K_LEFT}: s.ch_sel = (s.ch_sel - 1) % len(own)
+        if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE}: s.toggle_charm(own[s.ch_sel])
+
+    def save(s):
+        p = s.p
+        data = dict(spawn=list(s.spawn), geo=p.geo, maxhp=p.maxhp, dash=p.has_dash, wings=p.has_wings,
+                    claw=p.has_claw, taken=sorted(s.taken), dead=sorted(list(d) for d in s.dead if d in BOSS_IDS),
+                    bought=s.bought, nail=s.nail_lvl, focus=s.focus_lvl, soul=s.soul_lvl,
+                    visited=sorted(s.visited), shade=s.shade, charms=sorted(s.charms_owned),
+                    equipped=list(s.equipped), notches=s.notches)
+        try:
+            with open(SAVE, "w") as fh: json.dump(data, fh)
+        except OSError:
+            s.say("Could not write save file.", 3)
+
+    def apply_save(s):
+        try:
+            with open(SAVE) as fh: d = json.load(fh)
+        except (OSError, ValueError):
+            return
+        p = s.p
+        s.spawn = tuple(d.get("spawn", s.spawn)); p.geo = d.get("geo", 0); p.maxhp = d.get("maxhp", 5)
+        p.has_dash, p.has_wings, p.has_claw = d.get("dash", False), d.get("wings", False), d.get("claw", False)
+        s.taken = set(d.get("taken", [])); s.dead = {tuple(x) for x in d.get("dead", [])}
+        s.bought = d.get("bought", {}); s.nail_lvl = d.get("nail", 0)
+        s.focus_lvl = d.get("focus", 0); s.soul_lvl = d.get("soul", 0)
+        s.visited = set(d.get("visited", [])); s.shade = d.get("shade")
+        s.charms_owned = set(d.get("charms", [])); s.equipped = list(d.get("equipped", []))
+        s.notches = d.get("notches", 4)
 
     def build_solids(s):
         base, gt = ROOMS[s.ri], set()
@@ -962,6 +1137,7 @@ class Game:
         elif key == "nail": s.nail_lvl += 1
         elif key == "focus": s.focus_lvl = 1
         elif key == "soul": s.soul_lvl += 1
+        elif key.startswith("charm:"): s.charms_owned.add(key[6:])
         s.say("Purchased: " + label, 2.5)
 
     def respawn(s):
@@ -978,13 +1154,13 @@ class Game:
         s.spawn = (s.ri, int(p.x // T), 14)
         s.dead = {d for d in s.dead if d in BOSS_IDS}
         s.load_room(s.ri)
-        s.say("Rested. Bench set as your respawn point.", 2.5)
+        s.save(); s.say("Rested. Progress saved.", 2.5)
 
     def hurt(s, dmg, srcx):
         p = s.p
         if p.iframes > 0 or s.state != "play": return
         p.hp -= dmg
-        p.iframes, p.knock, p.focus, p.dashing, p.slash = 1.3, 0.25, 0, 0, None
+        p.iframes, p.knock, p.focus, p.dashing, p.slash = (2.0 if s.eq("stone_skin") else 1.3), 0.25, 0, 0, None
         p.vx = (1 if p.x + 12 > srcx else -1) * 320
         p.vy = -320
         s.shake = 0.2
@@ -1007,24 +1183,26 @@ class Game:
 
     def slash_rect(s):
         p = s.p; r = p.rect; d = p.slash["dir"]
-        if d == "up": return pygame.Rect(r.centerx - 24, r.top - 52, 48, 56)
-        if d == "down": return pygame.Rect(r.centerx - 24, r.bottom - 4, 48, 56)
-        return pygame.Rect(r.right - 4 if p.face > 0 else r.left - 56, r.centery - 24, 60, 48)
+        ex = 16 if s.eq("long_nail") else 0
+        if d == "up": return pygame.Rect(r.centerx - 24, r.top - 52 - ex, 48, 56 + ex)
+        if d == "down": return pygame.Rect(r.centerx - 24, r.bottom - 4, 48, 56 + ex)
+        if p.face > 0: return pygame.Rect(r.right - 4, r.centery - 24, 60 + ex, 48)
+        return pygame.Rect(r.left - 56 - ex, r.centery - 24, 60 + ex, 48)
 
     def hit_enemy(s, e, sl):
         p = s.p
         sl["hit"].add(id(e))
-        e.hp -= 5 + 3 * s.nail_lvl; e.flash = 0.12
-        p.soul = min(99, p.soul + 11 + 4 * s.soul_lvl)
+        e.hp -= 5 + 3 * s.nail_lvl + (3 if s.eq("heavy_nail") else 0); e.flash = 0.12
+        p.soul = min(99, p.soul + 11 + 4 * s.soul_lvl + (6 if s.eq("soul_catch") else 0))
         if e.kind not in HEAVY:
             e.stun = 0.2
             e.vx = p.face * 220 if sl["dir"] in ("l", "r") else 0
             if e.kind == "crawl": e.vy = -150
         if sl["dir"] == "down": s.pogo()
         if e.hp <= 0:
-            s.en.remove(e); s.dead.add(e.id); p.geo += e.geo
+            s.en.remove(e); s.dead.add(e.id); p.geo += int(e.geo * (1.5 if s.eq("greed") else 1))
             if e.kind in BOSSES:
-                s.say(BOSS_MSG[e.kind], 4); s.build_solids()
+                s.say(BOSS_MSG[e.kind] + "  (+1 charm notch)", 4); s.build_solids(); s.notches = min(11, s.notches + 1)
                 if e.id == FINAL_ID: s.timer = 2.5
 
     # ---- per-frame
@@ -1050,7 +1228,7 @@ class Game:
         if (k[K.K_f] and p.ground and p.soul >= 33 and p.hp < p.maxhp
                 and not dirx and p.knock <= 0 and p.dashing <= 0):
             p.focus += dt; p.vx = 0
-            if p.focus >= (0.65 if s.focus_lvl else 1.0):
+            if p.focus >= s.focus_time():
                 p.hp += 1; p.soul -= 33; p.focus = 0
         else:
             p.focus = 0
@@ -1058,13 +1236,13 @@ class Game:
         if p.focus == 0 and p.knock <= 0:
             if (pressed & {K.K_c, K.K_LSHIFT, K.K_l} and p.has_dash and p.dash_cd <= 0
                     and (p.ground or p.air_dash)):
-                p.dashing, p.dash_cd = 0.2, 0.6
+                p.dashing, p.dash_cd = (0.26, 0.3) if s.eq("swift_dash") else (0.2, 0.6)
                 if not p.ground: p.air_dash = False
             if p.dashing > 0:
                 p.vx, p.vy = p.face * 820, 0
             else:
                 if p.wj <= 0:
-                    p.vx = dirx * 290
+                    p.vx = dirx * (340 if s.eq("wind_stride") else 290)
                     if dirx: p.face = dirx
                 cling = p.has_claw and not p.ground and p.wall != 0 and dirx == p.wall
                 if cling and p.vy > 90: p.vy = 90
@@ -1081,7 +1259,7 @@ class Game:
                 if p.vy >= 0: p.jumping = False
             if pressed & {K.K_x, K.K_j} and p.atk_cd <= 0:
                 d = "up" if U else "down" if (D and not p.ground) else ("r" if p.face > 0 else "l")
-                p.slash, p.atk_cd = dict(dir=d, t=0.16, hit=set()), 0.35
+                p.slash, p.atk_cd = dict(dir=d, t=0.16, hit=set()), (0.22 if s.eq("quick_slash") else 0.35)
 
         if not p.ground and abs(p.vy) < 140 and jump_held and p.dashing <= 0:
             p.vy -= GRAV * dt * 0.45
@@ -1136,13 +1314,17 @@ class Game:
         # items & benches
         for name, ix, iy in s.room["items"]:
             if name not in s.taken and p.rect.colliderect(pygame.Rect(ix * T, iy * T, T, T)):
-                s.taken.add(name)
-                if name == "cloak": p.has_dash = True
-                elif name == "wings": p.has_wings = True
-                elif name == "claw": p.has_claw = True
-                elif name == "mask": p.maxhp += 1; p.hp = p.maxhp
-                elif name == "geocache": p.geo += 150
-                s.say(ITEM_MSG[name], 6)
+                s.taken.add(name); kd = name.split(":")[0].rstrip("0123456789")
+                if kd == "charm":
+                    ck = name.split(":")[1]; s.charms_owned.add(ck)
+                    s.say("Charm found: " + CHARMS[ck]["name"] + "!  Press I to equip it.", 6)
+                    continue
+                if kd == "cloak": p.has_dash = True
+                elif kd == "wings": p.has_wings = True
+                elif kd == "claw": p.has_claw = True
+                elif kd == "mask": p.maxhp += 1; p.hp = p.maxhp
+                elif kd == "geocache": p.geo += 150
+                s.say(ITEM_MSG[kd], 6)
         if pressed & {K.K_w, K.K_UP}: s.interact()
 
         # room transitions
@@ -1168,8 +1350,8 @@ class Game:
             for i, ln in enumerate(["A/D or arrows: move     Space / Z: jump (hold = higher)",
                                     "X / J: nail  (hold W = up, hold S in air = down-strike pogo)",
                                     "C / Shift: dash (find the cloak)   F (hold): Focus, heals for 33 Soul",
-                                    "W / Up: rest at benches, talk to bugs, use doors.    M: world map",
-                                    "", "Press ENTER to begin"]):
+                                    "W / Up: rest at benches, talk to bugs, use doors.    M: map    I: charms",
+                                    "", "Press ENTER for a new game" + ("      C to continue" if os.path.exists(SAVE) else "")]):
                 s.text(ln, s.font, (170, 175, 200), W // 2, 250 + i * 32, True)
             return
         shx = random.randint(-4, 4) if s.shake > 0 else 0
@@ -1221,7 +1403,7 @@ class Game:
         for name, ix, iy in s.room["items"]:
             if name not in s.taken:
                 mx, my = ix * T + ox + 16, iy * T + 16 + math.sin(t * 3) * 4
-                ic = ICON[name]
+                ic = ICON[name.split(":")[0].rstrip("0123456789")]
                 scr.blit(glow(40, ic), (mx - 40, my - 40))
                 pygame.draw.polygon(scr, ic, [(mx, my - 14), (mx + 14, my), (mx, my + 14), (mx - 14, my)])
                 pygame.draw.polygon(scr, (210, 245, 255), [(mx, my - 14), (mx + 6, my - 2), (mx, my + 2), (mx - 6, my - 2)])
@@ -1271,6 +1453,12 @@ class Game:
             a0 = {"r": -1.0, "l": math.pi - 1.0, "up": math.pi / 2 - 1.0, "down": -math.pi / 2 - 1.0}[p.slash["dir"]]
             pygame.draw.arc(scr, (255, 255, 255), sr, a0, a0 + 2.0, 6)
             pygame.draw.arc(scr, (190, 215, 255), sr.inflate(-10, -10), a0, a0 + 2.0, 3)
+        tn = s.room.get("tint")
+        if tn:
+            tc = s.__dict__.setdefault("_tints", {})
+            if tn not in tc:
+                ov = pygame.Surface((W, H), pygame.SRCALPHA); ov.fill((*tn, 34)); tc[tn] = ov
+            scr.blit(tc[tn], (0, 0))
         scr.blit(A["vig"], (0, 0))
         # HUD
         for i in range(p.maxhp):
@@ -1293,7 +1481,7 @@ class Game:
             s.text(s.room["name"], s.big, (215, 220, 240), W // 2, H // 2 - 220, True)
         if s.state == "talk":
             tk = s.talk; n = tk["npc"]
-            box = pygame.Rect(60, H - 200, W - 120, 170)
+            box = pygame.Rect(60, H - 230, W - 120, 200)
             pygame.draw.rect(scr, (14, 16, 30), box, border_radius=10)
             pygame.draw.rect(scr, (140, 150, 190), box, 2, border_radius=10)
             s.text(n["name"], s.font, (255, 230, 160), box.x + 18, box.y + 12)
@@ -1308,19 +1496,46 @@ class Game:
                     s.text(str(k + 1) + ")  " + lbl + "  -  " + price, s.font, (220, 224, 240), box.x + 18, box.y + 44 + k * 30)
                 s.text("Your Geo: " + str(p.geo) + "     Press 1-" + str(len(n["shop"])) + " to buy,  Enter to leave",
                        s.font, (130, 140, 180), box.x + 18, box.bottom - 34)
+        if s.show_charms:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((6, 8, 16, 238)); scr.blit(m, (0, 0))
+            used = s.notch_used()
+            s.text("CHARMS     I: close    A/D: choose    Enter: equip / unequip", s.font, (215, 220, 240), W // 2, 40, True)
+            for i in range(s.notches):
+                pygame.draw.circle(scr, (255, 200, 120) if i < used else (80, 84, 110),
+                                   (W // 2 - s.notches * 14 + i * 28 + 14, 92), 9, 0 if i < used else 2)
+            own = [k for k in CHARMS if k in s.charms_owned]
+            if not own:
+                s.text("You have not found any charms yet.", s.font, (170, 175, 200), W // 2, 260, True)
+            for i, k in enumerate(own):
+                cx_, cy_ = 110 + (i % 5) * 160, 180 + (i // 5) * 125
+                on = k in s.equipped
+                bx = pygame.Rect(cx_ - 58, cy_ - 42, 116, 100)
+                pygame.draw.rect(scr, (60, 50, 90) if on else (30, 34, 54), bx, border_radius=10)
+                pygame.draw.rect(scr, (255, 230, 140) if i == s.ch_sel % len(own) else (90, 100, 140), bx, 3, border_radius=10)
+                scr.blit(glow(30, (255, 170, 230) if on else (120, 130, 190)), (cx_ - 30, cy_ - 52))
+                pygame.draw.polygon(scr, (255, 190, 235) if on else (150, 160, 210),
+                                    [(cx_, cy_ - 24), (cx_ + 14, cy_ - 8), (cx_, cy_ + 10), (cx_ - 14, cy_ - 8)])
+                s.text(str(CHARMS[k]["cost"]), s.font, (255, 210, 130), bx.x + 8, bx.y + 4)
+                for j, ln in enumerate(wrap(s.font, CHARMS[k]["name"], 104)[:2]):
+                    s.text(ln, s.font, (220, 224, 240), cx_ - s.font.size(ln)[0] // 2, cy_ + 14 + j * 20)
+            if own:
+                k = own[s.ch_sel % len(own)]
+                s.text(CHARMS[k]["name"] + "  -  " + CHARMS[k]["desc"], s.font, (255, 230, 160), W // 2, H - 130, True)
+            if s.ch_t > 0:
+                s.text(s.ch_msg, s.font, (255, 140, 140), W // 2, H - 90, True)
         if s.show_map:
             m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((6, 8, 16, 235)); scr.blit(m, (0, 0))
-            cen = lambda i: (40 + MAP_POS[i][0] * 82 + 35, 200 + MAP_POS[i][1] * 80 + 20)
+            cw = min(82, (W - 80) // (max(q[0] for q in MAP_POS) + 1)); ch = int(cw * 0.6)
+            rc_ = lambda i: pygame.Rect(40 + MAP_POS[i][0] * cw, 170 + MAP_POS[i][1] * (ch + 14), cw - 8, ch)
             for (a_, side), b_ in LINKS.items():
-                if side == "R": pygame.draw.line(scr, (90, 100, 150), cen(a_), cen(b_), 3)
+                if side == "R": pygame.draw.line(scr, (90, 100, 150), rc_(a_).center, rc_(b_).center, 3)
             for i_, rm in enumerate(ROOMS):
-                for d in rm["doors"]: pygame.draw.line(scr, (70, 110, 150), cen(i_), cen(d["to"]), 2)
+                for d in rm["doors"]: pygame.draw.line(scr, (70, 110, 150), rc_(i_).center, rc_(d["to"]).center, 2)
             for i_ in range(len(ROOMS)):
-                rc = pygame.Rect(40 + MAP_POS[i_][0] * 82, 200 + MAP_POS[i_][1] * 80, 70, 40)
-                seen = i_ in s.visited
-                pygame.draw.rect(scr, (70, 80, 120) if seen else (28, 32, 50), rc, border_radius=6)
-                if i_ == s.ri: pygame.draw.rect(scr, (255, 230, 140), rc, 3, border_radius=6)
-                if seen: s.text(str(i_), s.font, (230, 235, 250), rc.centerx - 6, rc.y + 8)
+                rc = rc_(i_); seen = i_ in s.visited
+                pygame.draw.rect(scr, (70, 80, 120) if seen else (28, 32, 50), rc, border_radius=5)
+                if i_ == s.ri: pygame.draw.rect(scr, (255, 230, 140), rc, 3, border_radius=5)
+                if seen and cw >= 60: s.text(str(i_), s.font, (230, 235, 250), rc.centerx - 6, rc.y + 4)
             s.text("WORLD MAP   (M to close)", s.font, (215, 220, 240), W // 2, 90, True)
             s.text("You are in: " + s.room["name"], s.font, (255, 230, 160), W // 2, 130, True)
         if s.state == "dead":
@@ -1346,11 +1561,14 @@ class Game:
                 if ev.type == pygame.KEYDOWN: pressed.add(ev.key)
             if s.state in ("title", "win"):
                 if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER}: s.start()
+                elif pygame.K_c in pressed and os.path.exists(SAVE): s.start(load=True)
             elif s.state == "talk":
                 s.talk_update(pressed)
             elif s.state == "play":
-                if pygame.K_m in pressed: s.show_map = not s.show_map
-                if not s.show_map: s.update(dt, pressed)
+                if pygame.K_m in pressed: s.show_map = not s.show_map; s.show_charms = False
+                if pygame.K_i in pressed: s.show_charms = not s.show_charms; s.show_map = False
+                if s.show_charms: s.charm_input(pressed)
+                elif not s.show_map: s.update(dt, pressed)
             elif s.state == "dead":
                 s.timer -= dt
                 if s.timer <= 0: s.respawn(); s.state = "play"
