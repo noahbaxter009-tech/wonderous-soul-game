@@ -1,4 +1,4 @@
-""Wonderous Soul - a Hollow Knight-inspired 2D action Metroidvania.
+"""Wonderous Soul - a Hollow Knight-inspired 2D action Metroidvania.
 Run:  pip install pygame  &&  python wonderous_soul.py
 
 Mechanics: nail slash (up/down/side), downward-strike pogo (enemies + spikes),
@@ -202,6 +202,8 @@ class Body:
             if vy0 > 0: r.bottom = t.top; s.ground = True
             elif vy0 < 0: r.top = t.bottom
         if hit: s.y = r.y; s.vy = 0
+        if not s.ground and s.vy >= 0 and solids(room, s.rect.move(0, 1)):
+            s.ground = True; s.vy = 0
 
 
 class Player(Body):
@@ -1041,6 +1043,9 @@ class Game:
         p.buf -= dt
         p.coyote = 0.1 if p.ground else p.coyote - dt
 
+        if pressed & {K.K_f}:
+            if p.hp >= p.maxhp: s.say("Health is full.", 1.5)
+            elif p.soul < 33: s.say("Need 33 Soul to Focus. Hit enemies to gain Soul.", 2.5)
         # Focus (hold F to convert Soul into a mask)
         if (k[K.K_f] and p.ground and p.soul >= 33 and p.hp < p.maxhp
                 and not dirx and p.knock <= 0 and p.dashing <= 0):
