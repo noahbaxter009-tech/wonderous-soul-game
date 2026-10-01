@@ -11,17 +11,103 @@ import pygame
 
 W, H, T = 960, 544, 32
 SAVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wonderous_soul_save.json")
+SAVE_FILES = [SAVE, SAVE.replace(".json", "_2.json"), SAVE.replace(".json", "_3.json")]
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wonderous_soul_settings.json")
+VERSION = "0.9"
+DEFAULT_SETTINGS = dict(shake=True, vignette=True, fps=False, fullscreen=False, diff="Normal", last_slot=0)
+SETTINGS = dict(DEFAULT_SETTINGS)
+DIFF = {"Easy": (0.75, -1, 1.3), "Normal": (1.0, 0, 1.0), "Hard": (1.3, 0, 0.75)}   # hp mult, damage delta, i-frame mult
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as fh: SETTINGS.update(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    if SETTINGS.get("diff") not in DIFF: SETTINGS["diff"] = "Normal"
+
+
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w") as fh: json.dump(SETTINGS, fh)
+    except OSError:
+        pass
+
+
+def slot_info(i):
+    try:
+        with open(SAVE_FILES[i]) as fh: d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    ri = (d.get("spawn") or [0])[0]
+    return dict(room=ROOMS[ri]["name"] if isinstance(ri, int) and 0 <= ri < len(ROOMS) else "Unknown",
+                geo=d.get("geo", 0), hp=d.get("maxhp", 5),
+                abil=sum(bool(d.get(k)) for k in ("dash", "wings", "claw")),
+                charms=len(d.get("charms", [])), bosses=len(d.get("dead", [])),
+                explored=int(100 * len(d.get("visited", [])) / max(1, len(ROOMS))),
+                time=int(d.get("playtime", 0)))
+
+
+CONTROLS = [("Move", "A / D   or   Left / Right"), ("Jump (hold = higher)", "Space / Z"),
+            ("Double jump / wall jump", "Press jump again / jump on a wall"), ("Nail attack", "X / J"),
+            ("Strike upward", "Hold W / Up + attack"), ("Downward strike (pogo)", "Hold S / Down in the air + attack"),
+            ("Dash", "C / Left Shift / L"), ("Focus (heal)", "Hold F  (needs 33 Soul)"),
+            ("Talk / door / bench", "W / Up"), ("Buy in shops", "1 / 2 / 3"), ("World map", "M"),
+            ("Charms", "I"), ("Pause menu", "Esc")]
+CREDITS = ["WONDEROUS SOUL", "Version " + VERSION, "", "Created with Claude, made by Anthropic", "",
+           "Built with Python and pygame", "", "Inspired by Hollow Knight by Team Cherry.",
+           "A fan-inspired project. It is not affiliated with or endorsed by them,",
+           "and uses no assets from that game. All art is drawn in code.", "", "Thanks for playing!"]
+CHANGELOG = [
+    ("0.9", "Main Menu", ["New main menu with Start, Continue, Saves, Settings, Controls, Changelog, Credits and Quit.",
+                          "Three save slots with a summary of each: location, abilities, charms, bosses, exploration and play time.",
+                          "Settings for difficulty, screen shake, vignette, FPS counter and fullscreen, remembered between sessions.",
+                          "Pause menu on Esc."]),
+    ("0.8", "The Seraph", ["New final boss: a colossal angelic being that floats in the background.",
+                           "Lightning bolts are telegraphed with warning beams before they strike.",
+                           "Giant hands slam down. While one rests on the ground its sigil can be struck to hurt the Seraph.",
+                           "Three phases that add halo rings of light and sweeping judgement bolts."]),
+    ("0.7", "Charms", ["Ten equippable charms and a notch system. Bosses grant extra notches.",
+                       "Enemies grow tougher and hit harder in deeper regions."]),
+    ("0.6", "The Abyss", ["After the Warden, a gate opens into about 60 generated rooms in four regions with guardian bosses.",
+                          "Save and load, plus a world map that scales to the full world."]),
+    ("0.5", "Polish and fixes", ["Fixed Focus not working: the ground check flickered while standing still.",
+                                 "Walking now uses a proper two-bone leg animation.",
+                                 "Jumps use squash and stretch with a little float at the top."]),
+    ("0.4", "Expansion", ["World grew to 14 connected rooms with doors, benches and a map.",
+                          "NPCs, shops, and upgrades for Geo.",
+                          "New monsters: spitters, hoppers, armored beetles, bats and ghosts.",
+                          "New abilities: dash, double jump and wall cling.",
+                          "Bosses: the Husk Brute, the Crystal Weaver and the Warden."]),
+    ("0.3", "Look and feel", ["A flowing cape, textured stone and moss, a parallax cave background,",
+                              "glowing props, lanterns and a vignette.",
+                              "More lifelike monster art."]),
+    ("0.2", "Bug fixes", ["Fixed a crash on starting a game and a key lookup crash."]),
+    ("0.1", "First playable", ["Nail combat with pogo, dash, Soul and Focus healing, Geo, benches, death shades,",
+                               "three rooms and the first boss."]),
+]
+
+
+def build_changelog(font):
+    out = []
+    for ver, title, notes in CHANGELOG:
+        out.append(("h", "v" + ver + "  -  " + title))
+        for n in notes:
+            for k, ln in enumerate(wrap(font, n, 740)): out.append(("t", ("•  " if k == 0 else "     ") + ln))
+        out.append(("t", ""))
+    return out
 GRAV, MAXFALL, NAIL = 2200, 900, 5
 
 
 # ------------------------------------------------------------------ world
 FLYERS = {"fly", "bat", "ghost", "weaver"}
-BOSSES = {"boss", "weaver", "warden"}
+BOSSES = {"boss", "weaver", "warden", "seraph"}
 HEAVY = BOSSES | {"tank"}
-BOSS_NAME = {"boss": "HUSK BRUTE", "weaver": "CRYSTAL WEAVER", "warden": "THE WARDEN"}
+BOSS_NAME = {"boss": "HUSK BRUTE", "weaver": "CRYSTAL WEAVER", "warden": "THE WARDEN", "seraph": "THE SERAPH"}
 BOSS_MSG = {"boss": "The Husk Brute crumbles... the way east opens.",
             "weaver": "The Crystal Weaver shatters... the way forward opens.",
-            "warden": "The Warden falls."}
+            "warden": "The Warden falls.",
+            "seraph": "The Seraph dissolves into pure light..."}
 ICON = {"cloak": (120, 220, 255), "wings": (255, 240, 150), "claw": (255, 140, 120),
         "mask": (240, 240, 250), "geocache": (240, 200, 90), "charm": (255, 170, 230)}
 ITEM_MSG = {"cloak": "Mothwing Cloak acquired!  Press C / Shift to dash.",
@@ -248,6 +334,11 @@ def gen_room(rng, rname, ri, k, pool, tint, gid):
 
 
 def gen_boss_room(rname, tint, bkind, gid, is_last):
+    if is_last:
+        room = mkroom("The Celestial Court", 50, plats=[(6, 11, 5), (22, 9, 6), (40, 11, 5)], right=False,
+                      benches=[(3, 14)], spawns=[("seraph", 25, 3)])
+        room["tint"] = (255, 235, 170)
+        return room
     spawn = {"boss": ("boss", 22, 12), "weaver": ("weaver", 18, 5), "warden": ("warden", 26, 14)}[bkind]
     room = mkroom(rname + " Guardian", 38, plats=[(6, 11, 4), (28, 11, 4)], right=not is_last,
                   benches=[(3, 14)], gates=[] if is_last else [(37, 11, 1, 4, (gid, 0))], spawns=[spawn])
@@ -334,13 +425,15 @@ class Enemy(Body):
     STATS = {"crawl": (34, 22, 10, 1, 3), "fly": (28, 28, 10, 1, 5), "boss": (80, 90, 120, 2, 60),
              "spitter": (30, 38, 15, 1, 6), "hopper": (32, 26, 15, 1, 6), "tank": (48, 34, 30, 1, 12),
              "bat": (26, 22, 10, 1, 5), "ghost": (26, 36, 20, 1, 10),
-             "weaver": (70, 60, 160, 2, 120), "warden": (90, 100, 220, 2, 200)}
+             "weaver": (70, 60, 160, 2, 120), "warden": (90, 100, 220, 2, 200), "seraph": (8, 8, 360, 2, 500)}
 
     def __init__(s, kind, cx, cy, eid):
         w, h, s.hp, s.dmg, s.geo = Enemy.STATS[kind]
         dep = ROOM_DEPTH.get(eid[0], 0)
-        s.hp = int(s.hp * (1 + 0.35 * dep)); s.geo = int(s.geo * (1 + 0.3 * dep))
+        if kind != "seraph": s.hp = int(s.hp * (1 + 0.35 * dep))
+        s.geo = int(s.geo * (1 + 0.3 * dep))
         if dep >= 3 and kind not in BOSSES: s.dmg = 2
+        s.hp = max(1, int(s.hp * DIFF[SETTINGS["diff"]][0]))
         s.maxhp = s.hp
         super().__init__(cx * T, cy * T if kind in FLYERS else (cy + 1) * T - h, w, h)
         s.kind, s.id, s.flash, s.stun = kind, eid, 0, 0
@@ -349,6 +442,107 @@ class Enemy(Body):
         if kind == "bat": s.state = "hang"
         if kind == "spitter": s.t = 1.0 + random.random()
         if kind == "hopper": s.t = random.random() * 1.5
+        if kind == "seraph":
+            s.ax = cx * T + 16
+            s.x = s.y = -5000.0
+            s.phase, s.state, s.cool, s.t, s.intro_said = 1, "intro", 2.0, 3.0, False
+            s.sched, s.bolts, s.hands = [], [], []
+
+    def add_bolt(s, x, warn):
+        s.bolts.append(dict(x=x, warn=warn, t=0.0, state="warn"))
+
+    def add_hand(s, x):
+        s.hands.append(dict(x=x, y=-260.0, t=0.0, state="warn"))
+
+    def ring(s, g):
+        rot = random.random() * 6.28
+        for i in range(14):
+            a = rot + i * math.tau / 14
+            g.shots.append([s.ax, 110, math.cos(a) * 250, 4.5, math.sin(a) * 250, "holy"])
+
+    def seraph_ai(s, g, dt):
+        p, rw = g.p, g.room["w"] * T
+        s.x = s.y = -5000.0
+        ph = 1 if s.hp > s.maxhp * 0.66 else (2 if s.hp > s.maxhp * 0.33 else 3)
+        warn = {1: 1.0, 2: 0.8, 3: 0.65}[s.phase]
+        if s.state == "intro":
+            if not s.intro_said:
+                s.intro_said = True; g.say("A vast light opens its eyes...", 3)
+            s.t -= dt
+            if s.t <= 0: s.state, s.cool = "fight", 1.0
+            return
+        if s.state == "phase":
+            s.t -= dt
+            if s.t <= 0: s.state, s.cool = "fight", 1.2
+            return
+        if ph > s.phase:
+            s.phase, s.state, s.t = ph, "phase", 2.5
+            s.sched, s.bolts, s.hands = [], [], []
+            g.shake = 0.6
+            g.say("JUDGEMENT DRAWS NEAR!" if ph == 3 else "The light grows fierce...", 3)
+            return
+        for it in list(s.sched):
+            it[0] -= dt
+            if it[0] <= 0:
+                s.sched.remove(it); it[1]()
+        for b in list(s.bolts):
+            b["t"] += dt
+            if b["state"] == "warn" and b["t"] >= b["warn"]:
+                b["state"], b["t"] = "strike", 0.0
+                g.shake = max(g.shake, 0.12)
+            elif b["state"] == "strike":
+                if abs(p.x + p.w / 2 - b["x"]) < 30 and g.state == "play": g.hurt(2, b["x"])
+                if b["t"] >= 0.22: s.bolts.remove(b)
+        floor = 15 * T
+        for h in list(s.hands):
+            h["t"] += dt
+            if h["state"] == "warn":
+                if h["t"] >= 1.0: h["state"], h["t"] = "fall", 0.0
+            elif h["state"] == "fall":
+                h["y"] += 2400 * dt
+                if g.state == "play" and p.rect.colliderect(pygame.Rect(int(h["x"]) - 75, int(h["y"]), 150, 170).inflate(-20, -10)):
+                    g.hurt(2, h["x"])
+                if h["y"] + 170 >= floor:
+                    h["y"] = floor - 170; h["state"], h["t"] = "rest", 0.0
+                    g.shake = 0.4
+                    for d in (-1, 1): g.shots.append([h["x"], floor - 22, d * 360, 1.8, 0, "wave"])
+            elif h["state"] == "rest":
+                if h["t"] >= 3.2: h["state"], h["t"] = "rise", 0.0
+            else:
+                h["y"] -= 900 * dt
+                if h["y"] < -260: s.hands.remove(h)
+        s.cool -= dt
+        if s.cool <= 0 and not s.sched:
+            opts = ["track", "row", "hand"]
+            if s.phase >= 2: opts.append("rings")
+            if s.phase >= 3: opts.append("sweep")
+            if any(h["state"] in ("warn", "fall", "rest") for h in s.hands): opts.remove("hand")
+            a = random.choice(opts)
+            cx = p.x + p.w / 2
+            if a == "track":
+                n = 3 if s.phase == 1 else 5
+                for i in range(n):
+                    s.sched.append([i * 0.5, lambda: s.add_bolt(p.x + p.w / 2, warn)])
+                s.cool = 1.8 + n * 0.5
+            elif a == "row":
+                c, gap = int(cx // 160) * 160, random.randint(-2, 2)
+                for k in range(-3, 4):
+                    if k != gap: s.add_bolt(max(40, min(rw - 40, c + k * 160 + 80)), warn + 0.25)
+                s.cool = 3.0
+            elif a == "hand":
+                xs = [cx]
+                if s.phase >= 2: xs.append(cx + random.choice((-320, 320)))
+                for x in xs: s.add_hand(max(120, min(rw - 120, x)))
+                s.cool = 5.0
+            elif a == "rings":
+                for i in range(2): s.sched.append([i * 1.0, lambda: s.ring(g)])
+                s.cool = 4.0
+            else:
+                cols = list(range(60 + random.randint(0, 80), int(rw) - 60, 140))
+                if random.random() < 0.5: cols.reverse()
+                for i, x in enumerate(cols): s.sched.append([i * 0.14, (lambda x=x: s.add_bolt(x, warn))])
+                s.cool = 2.0 + len(cols) * 0.14
+            if s.phase == 3: s.cool *= 0.8
 
     def update(s, g, dt):
         p, room = g.p, g.room
@@ -452,6 +646,8 @@ class Enemy(Body):
                         g.shots.append([s.rect.centerx, s.rect.bottom - 22, d * 380, 1.6, 0, "wave"])
                     s.state, s.t, s.vy = "idle", 1.4, 0
             s.move(room, dt, False)
+        elif s.kind == "seraph":
+            s.seraph_ai(g, dt)
         elif s.kind in ("boss", "warden"):
             face = s.face = 1 if p.x > s.x else -1
             sp = 1.35 if s.kind == "warden" else 1
@@ -992,23 +1188,142 @@ def draw_weaver(scr, e, ox, t):
         pygame.draw.circle(scr, (255, 90, 190), (cx + s_ * 6, cy - 10), 2)
 
 
+def draw_seraph_bg(scr, e, cam, t):
+    sx = W // 2 + int((e.ax - (cam + W / 2)) * 0.1)
+    sy = 150
+    ph = e.phase
+    col = {1: (255, 226, 140), 2: (255, 240, 200), 3: (255, 150, 110)}[ph]
+    scr.blit(glow(300, col), (sx - 300, sy - 300))
+    layer = pygame.Surface((W, H), pygame.SRCALPHA)
+    flap = math.sin(t * 0.9) * 0.05
+    for s_ in (-1, 1):
+        for j in range(3):
+            bx, by = sx + s_ * 110, sy + 170 + j * 34
+            for i in range(9):
+                a = -0.9 + j * 0.55 + i * 0.075 + flap
+                ln = 760 - i * 28 - j * 60
+                dx, dy = math.cos(a) * s_, math.sin(a)
+                px, py = -dy * s_, dx * s_
+                mid = (bx + dx * ln * 0.6, by + dy * ln * 0.6)
+                tip = (bx + dx * ln, by + dy * ln)
+                pts = [(bx + px * 6, by + py * 6), (mid[0] + px * 24, mid[1] + py * 24), tip,
+                       (mid[0] - px * 24, mid[1] - py * 24), (bx - px * 6, by - py * 6)]
+                pygame.draw.polygon(layer, (255, 250, 235, 105), pts)
+                pygame.draw.polygon(layer, (*col, 150), pts, 1)
+    hc = (sx, sy - 250)
+    for rad, wd, spd in ((420, 6, 0.25), (340, 4, -0.35), (260, 3, 0.5)):
+        pygame.draw.circle(layer, (*col, 170), hc, rad, wd)
+        for n in range(36):
+            ang = t * spd + n * math.tau / 36
+            c0, s0 = math.cos(ang), math.sin(ang)
+            pygame.draw.line(layer, (*col, 200), (hc[0] + c0 * (rad - 14), hc[1] + s0 * (rad - 14)),
+                             (hc[0] + c0 * (rad + 14), hc[1] + s0 * (rad + 14)), 2)
+    pygame.draw.polygon(layer, (236, 232, 250, 150), [(sx - 200, sy + 170), (sx + 200, sy + 170), (sx + 430, H + 40), (sx - 430, H + 40)])
+    for k in range(-4, 5):
+        pygame.draw.line(layer, (200, 196, 225, 160), (sx + k * 40, sy + 200), (sx + k * 95, H + 40), 2)
+    pygame.draw.ellipse(layer, (236, 232, 250, 255), (sx - 240, sy - 290, 480, 580))
+    pygame.draw.ellipse(layer, (250, 248, 255, 255), (sx - 170, sy - 240, 260, 200))
+    pygame.draw.ellipse(layer, (196, 190, 224, 255), (sx - 240, sy - 290, 480, 580), 6)
+    pygame.draw.polygon(layer, (*col, 255), [(sx, sy - 200), (sx + 26, sy - 160), (sx, sy - 120), (sx - 26, sy - 160)], 3)
+    if ph >= 3:
+        for dx0, dy0, dx1, dy1 in ((-150, -40, -60, 120), (170, -90, 80, 60), (0, -230, -30, -100)):
+            pygame.draw.line(layer, (255, 120, 90, 230), (sx + dx0, sy + dy0), (sx + dx1, sy + dy1), 3)
+    scr.blit(layer, (0, 0))
+    open_eyes = e.state != "intro" or e.t < 1.2
+    for s_ in (-1, 1):
+        ex, ey = sx + s_ * 95, sy - 10
+        if open_eyes:
+            scr.blit(glow(90, col), (ex - 90, ey - 90))
+            pygame.draw.ellipse(scr, (255, 252, 230), (ex - 46, ey - 20, 92, 40))
+            pygame.draw.ellipse(scr, col, (ex - 22, ey - 18, 44, 36))
+            pygame.draw.circle(scr, (255, 255, 255), (ex, ey), 9)
+        else:
+            pygame.draw.arc(scr, (150, 140, 180), (ex - 46, ey - 16, 92, 40), 3.4, 6.0, 4)
+        pygame.draw.line(scr, (*col, ), (ex, ey + 22), (ex + s_ * 14, ey + 150), 3)
+    if e.state == "phase":
+        fo = pygame.Surface((W, H)); fo.fill(col); fo.set_alpha(int(60 + 40 * math.sin(t * 12))); scr.blit(fo, (0, 0))
+
+
+def draw_hand(scr, x, y, state, flash, t):
+    skin = (255, 255, 255) if flash else (238, 234, 252)
+    scr.blit(glow(100, (255, 230, 140)), (x - 100, y + 10))
+    pygame.draw.rect(scr, shade(skin, -34), (x - 70, y + 6, 140, 110), border_radius=30)
+    pygame.draw.rect(scr, skin, (x - 75, y, 150, 110), border_radius=32)
+    for i in range(5):
+        fx = x - 68 + i * 34
+        fl = 72 if i in (1, 2, 3) else 60
+        pygame.draw.rect(scr, skin, (fx, y + 90, 26, fl), border_radius=13)
+        pygame.draw.rect(scr, shade(skin, -28), (fx, y + 90, 26, fl), 2, border_radius=13)
+    if state == "rest":
+        pul = 0.6 + 0.4 * math.sin(t * 8)
+        scr.blit(glow(56, (255, 210, 110)), (x - 56, y - 6))
+        pygame.draw.circle(scr, (255, 215, 110), (x, y + 50), int(22 + 4 * pul), 3)
+        pygame.draw.line(scr, (255, 215, 110), (x - 16, y + 50), (x + 16, y + 50), 3)
+        pygame.draw.line(scr, (255, 215, 110), (x, y + 34), (x, y + 66), 3)
+    elif state == "fall":
+        pygame.draw.line(scr, (255, 245, 200), (x - 40, y - 120), (x - 40, y), 3)
+        pygame.draw.line(scr, (255, 245, 200), (x + 40, y - 120), (x + 40, y), 3)
+
+
+def draw_seraph_fg(scr, e, ox, t):
+    floor = 15 * T
+    strike = False
+    for b in e.bolts:
+        x = int(b["x"]) + ox
+        if b["state"] == "warn":
+            k = b["t"] / b["warn"]
+            col = (255, 240, 160) if int(b["t"] * (8 + 14 * k)) % 2 == 0 else (255, 160, 90)
+            pygame.draw.line(scr, col, (x, 0), (x, floor), 2 + int(k * 6))
+            pygame.draw.ellipse(scr, col, (x - 30, floor - 8, 60, 12), 2)
+            scr.blit(glow(26, (255, 230, 130)), (x - 26, floor - 26))
+        else:
+            strike = True
+            rg = random.Random(int(b["x"]) + int(b["t"] * 60))
+            pts, yy = [(x, 0)], 0
+            while yy < floor:
+                yy += rg.randint(40, 70)
+                pts.append((x + rg.randint(-24, 24), min(yy, floor)))
+            pygame.draw.lines(scr, (255, 255, 210), False, pts, 16)
+            pygame.draw.lines(scr, (255, 255, 255), False, pts, 6)
+            scr.blit(glow(60, (255, 240, 160)), (x - 60, floor - 60))
+    for h in e.hands:
+        x = int(h["x"]) + ox
+        if h["state"] == "warn":
+            k = min(1.0, h["t"])
+            sh = pygame.Surface((240, 40), pygame.SRCALPHA)
+            wd = int(80 + 140 * k)
+            pygame.draw.ellipse(sh, (0, 0, 0, int(50 + 110 * k)), (120 - wd // 2, 6, wd, 28))
+            scr.blit(sh, (x - 120, floor - 22))
+            pygame.draw.line(scr, (255, 240, 180), (x - 75, 0), (x + 75, 0), 4)
+        else:
+            draw_hand(scr, x, int(h["y"]), h["state"], e.flash > 0, t)
+    if strike:
+        fo = pygame.Surface((W, H)); fo.fill((255, 255, 230)); fo.set_alpha(60); scr.blit(fo, (0, 0))
+
+
 DRAWERS = {"crawl": lambda a, e, o, t: draw_crawl(a, e, o), "fly": lambda a, e, o, t: draw_fly(a, e, o),
            "spitter": draw_spitter, "hopper": lambda a, e, o, t: draw_hopper(a, e, o),
            "tank": lambda a, e, o, t: draw_tank(a, e, o), "bat": lambda a, e, o, t: draw_bat(a, e, o),
-           "ghost": draw_ghost, "weaver": draw_weaver, "boss": draw_boss, "warden": draw_boss}
+           "ghost": draw_ghost, "weaver": draw_weaver, "boss": draw_boss, "warden": draw_boss, "seraph": draw_seraph_fg}
 
 
 # ------------------------------------------------------------------ game
 class Game:
     def __init__(s):
         pygame.init()
-        s.scr = pygame.display.set_mode((W, H))
+        try: s.scr = pygame.display.set_mode((W, H), pygame.SCALED)
+        except Exception: s.scr = pygame.display.set_mode((W, H))
         pygame.display.set_caption("Wonderous Soul")
         s.clock = pygame.time.Clock()
         s.font = pygame.font.SysFont("georgia", 20)
         s.big = pygame.font.SysFont("georgia", 54)
+        s.mid = pygame.font.SysFont("georgia", 32)
         s.state = "title"
         s.art, s.props = make_art(), {}
+        load_settings()
+        s.mscreen, s.msel, s.mscroll, s.mreturn, s.confirm = "main", 0, 0.0, "main", None
+        s.new_mode, s.slot, s.playtime, s.fs_on, s._cl, s.slots = False, 0, 0.0, False, None, [None] * 3
+        s.refresh_slots(); s.apply_fullscreen()
 
     def start(s, load=False):
         s.p = Player()
@@ -1018,7 +1333,8 @@ class Game:
         s.show_map, s.talk, s.area_t = False, None, 0
         s.charms_owned, s.equipped, s.notches = set(), [], 4
         s.ch_sel, s.show_charms, s.ch_msg, s.ch_t = 0, False, "", 0
-        s.shake = s.note_t = s.timer = s.cam = 0
+        s.playtime = 0.0
+        s.shake = s.note_t = s.timer = s.cam = s.flash_t = 0
         s.note = ""
         if load: s.apply_save()
         s.respawn()
@@ -1033,6 +1349,218 @@ class Game:
         s.build_solids(); s.visited.add(i); s.p.cape = None
         s.en = [Enemy(k, x, y, (i, n)) for n, (k, x, y) in enumerate(s.room["spawns"])
                 if (i, n) not in s.dead]
+
+    def refresh_slots(s):
+        s.slots = [slot_info(i) for i in range(3)]
+
+    def go(s, screen):
+        s.mscreen, s.msel, s.mscroll, s.confirm = screen, 0, 0.0, None
+        s.refresh_slots()
+
+    def to_menu(s):
+        s.state, s.mreturn = "title", "main"
+        s.go("main")
+
+    def open_pause(s):
+        s.state, s.mreturn = "pause", "pause"
+        s.go("pause")
+
+    def apply_fullscreen(s):
+        want = bool(SETTINGS["fullscreen"])
+        if want != s.fs_on:
+            try: pygame.display.toggle_fullscreen()
+            except Exception: pass
+            s.fs_on = want
+
+    def menu_items(s):
+        if s.mscreen == "pause": return ["Resume", "Settings", "Controls", "Main Menu", "Quit"]
+        items = ["Start", "Saves", "Settings", "Controls", "Changelog", "Credits", "Quit"]
+        if any(s.slots): items.insert(1, "Continue")
+        return items
+
+    def settings_rows(s):
+        onoff = lambda v: "On" if v else "Off"
+        return [("Difficulty", SETTINGS["diff"]), ("Screen shake", onoff(SETTINGS["shake"])),
+                ("Vignette", onoff(SETTINGS["vignette"])), ("Show FPS", onoff(SETTINGS["fps"])),
+                ("Fullscreen", onoff(SETTINGS["fullscreen"])), ("Reset to defaults", ""), ("Back", "")]
+
+    def change_setting(s, i, d):
+        keys = ["diff", "shake", "vignette", "fps", "fullscreen"]
+        if i < 5:
+            k = keys[i]
+            if k == "diff":
+                order = ["Easy", "Normal", "Hard"]
+                SETTINGS[k] = order[(order.index(SETTINGS[k]) + d) % 3]
+            else:
+                SETTINGS[k] = not SETTINGS[k]
+                if k == "fullscreen": s.apply_fullscreen()
+        elif i == 5:
+            keep = SETTINGS["last_slot"]
+            SETTINGS.update(DEFAULT_SETTINGS); SETTINGS["last_slot"] = keep
+            s.apply_fullscreen()
+        else:
+            s.go(s.mreturn); return
+        save_settings()
+
+    def begin(s, load):
+        SETTINGS["last_slot"] = s.slot; save_settings()
+        s.start(load=load)
+
+    def menu_select(s, it):
+        origin = s.mscreen
+        if it == "Resume": s.state = "play"
+        elif it == "Main Menu": s.to_menu()
+        elif it == "Quit": pygame.quit(); sys.exit()
+        elif it == "Continue":
+            sl = SETTINGS.get("last_slot", 0)
+            if not s.slots[sl]: sl = next(i for i in range(3) if s.slots[i])
+            s.slot = sl; s.begin(True)
+        else:
+            s.mreturn = origin
+            s.new_mode = it == "Start"
+            s.go({"Start": "saves", "Saves": "saves", "Settings": "settings", "Controls": "controls",
+                  "Changelog": "changelog", "Credits": "credits"}[it])
+            if it in ("Start", "Saves"): s.msel = SETTINGS.get("last_slot", 0)
+
+    def run_confirm(s):
+        kind, i = s.confirm
+        s.confirm = None
+        if kind == "delete":
+            try: os.remove(SAVE_FILES[i])
+            except OSError: pass
+            s.refresh_slots()
+        else:
+            s.slot = i; s.begin(False)
+
+    def menu_input(s, pressed, dt):
+        K = pygame
+        up, down = pressed & {K.K_w, K.K_UP}, pressed & {K.K_s, K.K_DOWN}
+        left, right = pressed & {K.K_a, K.K_LEFT}, pressed & {K.K_d, K.K_RIGHT}
+        ok = pressed & {K.K_RETURN, K.K_KP_ENTER, K.K_SPACE}
+        back = pressed & {K.K_ESCAPE, K.K_BACKSPACE}
+        sc = s.mscreen
+        if s.confirm:
+            if ok: s.run_confirm()
+            elif back: s.confirm = None
+            return
+        if sc in ("main", "pause"):
+            items = s.menu_items(); n = len(items)
+            if up: s.msel = (s.msel - 1) % n
+            if down: s.msel = (s.msel + 1) % n
+            if ok: s.menu_select(items[s.msel])
+            elif back and sc == "pause": s.state = "play"
+        elif sc == "saves":
+            if up: s.msel = (s.msel - 1) % 3
+            if down: s.msel = (s.msel + 1) % 3
+            if ok:
+                s.slot = s.msel
+                if s.slots[s.msel] and s.new_mode: s.confirm = ("overwrite", s.msel)
+                else: s.begin(bool(s.slots[s.msel]))
+            elif pressed & {K.K_x, K.K_DELETE}:
+                if s.slots[s.msel]: s.confirm = ("delete", s.msel)
+            elif back: s.go(s.mreturn)
+        elif sc == "settings":
+            if up: s.msel = (s.msel - 1) % 7
+            if down: s.msel = (s.msel + 1) % 7
+            if left: s.change_setting(s.msel, -1)
+            elif right or ok: s.change_setting(s.msel, 1)
+            elif back: s.go(s.mreturn)
+        else:
+            if sc == "changelog":
+                k = K.key.get_pressed()
+                s.mscroll += (int(bool(k[K.K_s] or k[K.K_DOWN])) - int(bool(k[K.K_w] or k[K.K_UP]))) * 420 * dt
+            if back: s.go(s.mreturn)
+
+    def draw_menu(s, overlay=False):
+        scr, A = s.scr, s.art
+        t = pygame.time.get_ticks() / 1000
+        gold, dim, white = (255, 230, 160), (150, 156, 190), (225, 228, 245)
+        if overlay:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((6, 8, 16, 222)); scr.blit(m, (0, 0))
+        else:
+            scr.blit(A["bg"], (0, 0))
+            for key, sp in (("far", 12), ("near", 24)):
+                x0 = -int(t * sp) % 1500 - 1500
+                scr.blit(A[key], (x0, 0)); scr.blit(A[key], (x0 + 1500, 0))
+            for x0, y0, ph, sp in A["spores"]:
+                pygame.draw.circle(scr, (110, 130, 175), (int((x0 + t * 8 * sp) % W),
+                                   int((y0 + math.sin(t * sp + ph) * 15 - t * 4 * sp) % H)), 1 + int(sp > 0.9))
+            scr.blit(A["vig"], (0, 0))
+        sc, sel = s.mscreen, s.msel
+        if sc in ("main", "pause"):
+            scr.blit(glow(230, (110, 130, 255)), (W // 2 - 230, 20))
+            s.text("WONDEROUS SOUL" if sc == "main" else "PAUSED", s.big, (230, 232, 250), W // 2, 60, True)
+            if sc == "main": s.text("a Hollow Knight-inspired metroidvania", s.font, dim, W // 2, 130, True)
+            for i, it in enumerate(s.menu_items()):
+                y = 185 + i * 37
+                if i == sel:
+                    pygame.draw.rect(scr, (40, 46, 84), (W // 2 - 150, y - 4, 300, 33), border_radius=8)
+                    pygame.draw.rect(scr, gold, (W // 2 - 150, y - 4, 300, 33), 2, border_radius=8)
+                s.text(it, s.font, gold if i == sel else white, W // 2, y + 1, True)
+            if sc == "pause": s.text("Progress since your last bench is not saved.", s.font, dim, W // 2, H - 80, True)
+            s.text("W/S: choose     Enter: select" + ("     Esc: resume" if sc == "pause" else ""), s.font, dim, W // 2, H - 44, True)
+            s.text("v" + VERSION, s.font, dim, W - 90, H - 44)
+        elif sc == "saves":
+            s.text("NEW GAME  -  CHOOSE A SLOT" if s.new_mode else "SAVE SLOTS", s.mid, white, W // 2, 30, True)
+            for i in range(3):
+                bx, info = pygame.Rect(110, 100 + i * 118, W - 220, 106), s.slots[i]
+                pygame.draw.rect(scr, (44, 50, 90) if i == sel else (30, 34, 58), bx, border_radius=10)
+                pygame.draw.rect(scr, gold if i == sel else (80, 90, 130), bx, 3 if i == sel else 2, border_radius=10)
+                s.text("Slot %d" % (i + 1), s.font, gold, bx.x + 18, bx.y + 8)
+                if info:
+                    s.text(info["room"], s.font, white, bx.x + 120, bx.y + 8)
+                    s.text("Masks %d     Geo %d     Abilities %d/3" % (info["hp"], info["geo"], info["abil"]), s.font, dim, bx.x + 18, bx.y + 40)
+                    s.text("Charms %d/10     Bosses %d     Explored %d%%     Time %d:%02d" % (
+                        info["charms"], info["bosses"], info["explored"], info["time"] // 3600, info["time"] % 3600 // 60),
+                        s.font, dim, bx.x + 18, bx.y + 68)
+                else:
+                    s.text("- Empty -", s.font, dim, bx.x + 120, bx.y + 8)
+                    s.text("Start a new game here.", s.font, dim, bx.x + 18, bx.y + 40)
+            s.text("Enter: " + ("new game" if s.new_mode else "load / new") + "     X: delete     Esc: back",
+                   s.font, dim, W // 2, H - 44, True)
+        elif sc == "settings":
+            s.text("SETTINGS", s.mid, white, W // 2, 30, True)
+            for i, (lab, val) in enumerate(s.settings_rows()):
+                y = 110 + i * 52
+                bx = pygame.Rect(180, y - 6, W - 360, 42)
+                if i == sel:
+                    pygame.draw.rect(scr, (44, 50, 90), bx, border_radius=8)
+                    pygame.draw.rect(scr, gold, bx, 2, border_radius=8)
+                s.text(lab, s.font, gold if i == sel else white, bx.x + 18, y)
+                if val:
+                    txt = "<  " + val + "  >"
+                    s.text(txt, s.font, gold if i == sel else dim, bx.right - 18 - s.font.size(txt)[0], y)
+            s.text("W/S: choose     A/D or Enter: change     Esc: back", s.font, dim, W // 2, H - 44, True)
+        elif sc == "controls":
+            s.text("CONTROLS", s.mid, white, W // 2, 30, True)
+            for i, (act, keys) in enumerate(CONTROLS):
+                y = 100 + i * 31
+                s.text(act, s.font, gold, 120, y)
+                s.text(keys, s.font, white, 450, y)
+            s.text("Esc: back", s.font, dim, W // 2, H - 44, True)
+        elif sc == "changelog":
+            s.text("CHANGELOG", s.mid, white, W // 2, 30, True)
+            if s._cl is None: s._cl = build_changelog(s.font)
+            view = pygame.Rect(90, 100, W - 180, H - 170)
+            s.mscroll = max(0, min(s.mscroll, max(0, len(s._cl) * 26 - view.h)))
+            scr.set_clip(view)
+            for i, (kind, text) in enumerate(s._cl):
+                s.text(text, s.font, gold if kind == "h" else white, view.x, view.y + i * 26 - int(s.mscroll))
+            scr.set_clip(None)
+            s.text("W/S: scroll     Esc: back", s.font, dim, W // 2, H - 44, True)
+        elif sc == "credits":
+            for i, ln in enumerate(CREDITS):
+                s.text(ln, s.big if i == 0 else s.font, (230, 232, 250) if i == 0 else white, W // 2, 70 + i * 36 + (30 if i else 0), True)
+            s.text("Esc: back", s.font, dim, W // 2, H - 44, True)
+        if s.confirm:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((0, 0, 0, 170)); scr.blit(m, (0, 0))
+            kind, i = s.confirm
+            box = pygame.Rect(W // 2 - 300, H // 2 - 80, 600, 160)
+            pygame.draw.rect(scr, (20, 24, 44), box, border_radius=12); pygame.draw.rect(scr, gold, box, 2, border_radius=12)
+            msg = ("Delete slot %d? This cannot be undone." % (i + 1) if kind == "delete" else
+                   "Slot %d already has a save. Start a new game here anyway?" % (i + 1))
+            for k, ln in enumerate(wrap(s.font, msg, 540)): s.text(ln, s.font, white, W // 2, box.y + 28 + k * 28, True)
+            s.text("Enter: yes     Esc: no", s.font, gold, W // 2, box.bottom - 40, True)
 
     def eq(s, key):
         return key in s.equipped
@@ -1070,15 +1598,15 @@ class Game:
                     claw=p.has_claw, taken=sorted(s.taken), dead=sorted(list(d) for d in s.dead if d in BOSS_IDS),
                     bought=s.bought, nail=s.nail_lvl, focus=s.focus_lvl, soul=s.soul_lvl,
                     visited=sorted(s.visited), shade=s.shade, charms=sorted(s.charms_owned),
-                    equipped=list(s.equipped), notches=s.notches)
+                    equipped=list(s.equipped), notches=s.notches, playtime=s.playtime)
         try:
-            with open(SAVE, "w") as fh: json.dump(data, fh)
+            with open(SAVE_FILES[s.slot], "w") as fh: json.dump(data, fh)
         except OSError:
             s.say("Could not write save file.", 3)
 
     def apply_save(s):
         try:
-            with open(SAVE) as fh: d = json.load(fh)
+            with open(SAVE_FILES[s.slot]) as fh: d = json.load(fh)
         except (OSError, ValueError):
             return
         p = s.p
@@ -1089,7 +1617,7 @@ class Game:
         s.focus_lvl = d.get("focus", 0); s.soul_lvl = d.get("soul", 0)
         s.visited = set(d.get("visited", [])); s.shade = d.get("shade")
         s.charms_owned = set(d.get("charms", [])); s.equipped = list(d.get("equipped", []))
-        s.notches = d.get("notches", 4)
+        s.notches = d.get("notches", 4); s.playtime = d.get("playtime", 0.0)
 
     def build_solids(s):
         base, gt = ROOMS[s.ri], set()
@@ -1159,8 +1687,8 @@ class Game:
     def hurt(s, dmg, srcx):
         p = s.p
         if p.iframes > 0 or s.state != "play": return
-        p.hp -= dmg
-        p.iframes, p.knock, p.focus, p.dashing, p.slash = (2.0 if s.eq("stone_skin") else 1.3), 0.25, 0, 0, None
+        p.hp -= max(1, dmg + DIFF[SETTINGS["diff"]][1])
+        p.iframes, p.knock, p.focus, p.dashing, p.slash = (2.0 if s.eq("stone_skin") else 1.3) * DIFF[SETTINGS["diff"]][2], 0.25, 0, 0, None
         p.vx = (1 if p.x + 12 > srcx else -1) * 320
         p.vy = -320
         s.shake = 0.2
@@ -1203,7 +1731,7 @@ class Game:
             s.en.remove(e); s.dead.add(e.id); p.geo += int(e.geo * (1.5 if s.eq("greed") else 1))
             if e.kind in BOSSES:
                 s.say(BOSS_MSG[e.kind] + "  (+1 charm notch)", 4); s.build_solids(); s.notches = min(11, s.notches + 1)
-                if e.id == FINAL_ID: s.timer = 2.5
+                if e.id == FINAL_ID: s.timer, s.flash_t = 2.5, 2.5
 
     # ---- per-frame
     def update(s, dt, pressed):
@@ -1215,7 +1743,7 @@ class Game:
         dirx = int(bool(R)) - int(bool(L))
         for a in ("iframes", "knock", "dash_cd", "atk_cd", "dashing", "wj"):
             setattr(p, a, max(0, getattr(p, a) - dt))
-        s.shake = max(0, s.shake - dt); s.note_t = max(0, s.note_t - dt); s.area_t = max(0, s.area_t - dt)
+        s.shake = max(0, s.shake - dt); s.note_t = max(0, s.note_t - dt); s.area_t = max(0, s.area_t - dt); s.flash_t = max(0, s.flash_t - dt); s.playtime += dt
 
         if pressed & {K.K_SPACE, K.K_z}: p.buf = 0.12
         p.buf -= dt
@@ -1282,6 +1810,10 @@ class Game:
             r = s.slash_rect()
             for e in list(s.en):
                 if id(e) not in sl["hit"] and r.colliderect(e.rect): s.hit_enemy(e, sl)
+                elif e.kind == "seraph" and id(e) not in sl["hit"] and e.state == "fight":
+                    for hd in e.hands:
+                        if hd["state"] == "rest" and r.colliderect(pygame.Rect(int(hd["x"]) - 75, int(hd["y"]), 150, 170)):
+                            s.hit_enemy(e, sl); break
             if sl["dir"] == "down" and "pogo" not in sl:
                 for cx, cy in s.room["spikes"]:
                     if r.colliderect(pygame.Rect(cx * T, cy * T, T, T)):
@@ -1345,16 +1877,8 @@ class Game:
         t = pygame.time.get_ticks() / 1000
         scr.blit(A["bg"], (0, 0))
         if s.state == "title":
-            scr.blit(A["far"], (0, 0))
-            s.text("WONDEROUS SOUL", s.big, (230, 230, 245), W // 2, 150, True)
-            for i, ln in enumerate(["A/D or arrows: move     Space / Z: jump (hold = higher)",
-                                    "X / J: nail  (hold W = up, hold S in air = down-strike pogo)",
-                                    "C / Shift: dash (find the cloak)   F (hold): Focus, heals for 33 Soul",
-                                    "W / Up: rest at benches, talk to bugs, use doors.    M: map    I: charms",
-                                    "", "Press ENTER for a new game" + ("      C to continue" if os.path.exists(SAVE) else "")]):
-                s.text(ln, s.font, (170, 175, 200), W // 2, 250 + i * 32, True)
-            return
-        shx = random.randint(-4, 4) if s.shake > 0 else 0
+            s.draw_menu(); return
+        shx = random.randint(-4, 4) if s.shake > 0 and SETTINGS["shake"] else 0
         cam, p = int(s.cam), s.p
         ox = -cam + shx
         for key, fac in (("far", 0.2), ("near", 0.45)):
@@ -1365,6 +1889,8 @@ class Game:
             sx = (x0 + t * 8 * sp - cam * 0.6) % W
             sy = (y0 + math.sin(t * sp + ph) * 15 - t * 4 * sp) % H
             pygame.draw.circle(scr, (110, 130, 175), (int(sx), int(sy)), 1 + int(sp > 0.9))
+        for e in s.en:
+            if e.kind == "seraph": draw_seraph_bg(scr, e, cam, t)
         sol = s.room["solid"]
         for cx, cy in sol:
             x, y = cx * T + ox, cy * T
@@ -1429,7 +1955,7 @@ class Game:
         for x, y, vx, life, vy, kind in s.shots:
             if kind != "wave":
                 sx, yy = int(x) + ox, int(y)
-                gc = (170, 240, 130) if kind == "spit" else (190, 130, 255)
+                gc = (170, 240, 130) if kind == "spit" else ((255, 225, 120) if kind == "holy" else (190, 130, 255))
                 scr.blit(glow(20, gc), (sx - 20, yy - 20))
                 pygame.draw.circle(scr, shade(gc, 50), (sx, yy), 6)
                 pygame.draw.circle(scr, (255, 255, 255), (sx - 2, yy - 2), 2)
@@ -1440,7 +1966,7 @@ class Game:
             pygame.draw.polygon(scr, (200, 120, 50), [(sx - d * 14, y + 22), (sx - d * 6, y + 8), (sx + d * 2, y + 14),
                                                       (sx + d * 10, y), (sx + d * 16, y + 22)])
             pygame.draw.polygon(scr, (255, 200, 110), [(sx - d * 6, y + 22), (sx, y + 12), (sx + d * 8, y + 22)])
-        if s.state in ("play", "talk") and (p.iframes <= 0 or int(p.iframes * 20) % 2):
+        if s.state in ("play", "talk", "pause") and (p.iframes <= 0 or int(p.iframes * 20) % 2):
             r = p.rect.move(ox, 0)
             if p.focus > 0:
                 scr.blit(glow(46, (150, 200, 255)), (r.centerx - 46, r.centery - 46))
@@ -1459,7 +1985,7 @@ class Game:
             if tn not in tc:
                 ov = pygame.Surface((W, H), pygame.SRCALPHA); ov.fill((*tn, 34)); tc[tn] = ov
             scr.blit(tc[tn], (0, 0))
-        scr.blit(A["vig"], (0, 0))
+        if SETTINGS["vignette"]: scr.blit(A["vig"], (0, 0))
         # HUD
         for i in range(p.maxhp):
             c = (240, 240, 250) if i < p.hp else (70, 70, 90)
@@ -1538,14 +2064,19 @@ class Game:
                 if seen and cw >= 60: s.text(str(i_), s.font, (230, 235, 250), rc.centerx - 6, rc.y + 4)
             s.text("WORLD MAP   (M to close)", s.font, (215, 220, 240), W // 2, 90, True)
             s.text("You are in: " + s.room["name"], s.font, (255, 230, 160), W // 2, 130, True)
+        if s.state == "pause": s.draw_menu(True)
+        if SETTINGS["fps"]: s.text(str(int(s.clock.get_fps())) + " FPS", s.font, (150, 160, 190), W - 90, 8)
+        if s.flash_t > 0:
+            fo = pygame.Surface((W, H)); fo.fill((255, 250, 235))
+            fo.set_alpha(int(255 * (1 - s.flash_t / 2.5))); scr.blit(fo, (0, 0))
         if s.state == "dead":
             v = pygame.Surface((W, H)); v.set_alpha(int(255 * min(1, (2 - s.timer) / 1.2)))
             scr.blit(v, (0, 0))
             s.text("You have fallen...", s.big, (200, 200, 220), W // 2, H // 2 - 30, True)
         if s.state == "win":
             scr.fill((10, 10, 20))
-            s.text("The Warden has fallen.", s.big, (230, 230, 245), W // 2, 200, True)
-            s.text(f"Geo collected: {s.p.geo}     Press ENTER to play again", s.font, (170, 175, 200), W // 2, 290, True)
+            s.text("The Seraph has returned to the light.", s.big, (230, 230, 245), W // 2, 200, True)
+            s.text(f"Geo collected: {s.p.geo}     Press ENTER for the main menu", s.font, (170, 175, 200), W // 2, 290, True)
 
     def text(s, t, f, c, x, y, center=False):
         im = f.render(t, True, c)
@@ -1556,20 +2087,27 @@ class Game:
             dt = min(s.clock.tick(60) / 1000, 1 / 30)
             pressed = set()
             for ev in pygame.event.get():
-                if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
+                if ev.type == pygame.QUIT:
                     pygame.quit(); sys.exit()
                 if ev.type == pygame.KEYDOWN: pressed.add(ev.key)
-            if s.state in ("title", "win"):
-                if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER}: s.start()
-                elif pygame.K_c in pressed and os.path.exists(SAVE): s.start(load=True)
-            elif s.state == "talk":
-                s.talk_update(pressed)
-            elif s.state == "play":
-                if pygame.K_m in pressed: s.show_map = not s.show_map; s.show_charms = False
-                if pygame.K_i in pressed: s.show_charms = not s.show_charms; s.show_map = False
-                if s.show_charms: s.charm_input(pressed)
-                elif not s.show_map: s.update(dt, pressed)
-            elif s.state == "dead":
+            st = s.state
+            if st in ("title", "pause"):
+                s.menu_input(pressed, dt)
+            elif st == "win":
+                if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE}: s.to_menu()
+            elif st == "talk":
+                if pygame.K_ESCAPE in pressed: s.state = "play"
+                else: s.talk_update(pressed)
+            elif st == "play":
+                if pygame.K_ESCAPE in pressed:
+                    if s.show_map or s.show_charms: s.show_map = s.show_charms = False
+                    else: s.open_pause()
+                else:
+                    if pygame.K_m in pressed: s.show_map = not s.show_map; s.show_charms = False
+                    if pygame.K_i in pressed: s.show_charms = not s.show_charms; s.show_map = False
+                    if s.show_charms: s.charm_input(pressed)
+                    elif not s.show_map: s.update(dt, pressed)
+            elif st == "dead":
                 s.timer -= dt
                 if s.timer <= 0: s.respawn(); s.state = "play"
             s.draw()
