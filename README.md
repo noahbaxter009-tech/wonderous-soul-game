@@ -1,9 +1,14 @@
-# wonderous-soul-game
+[Uploading README.md…]()
 
+# Wonderous Soul
 
 A 2D action Metroidvania written in Python with pygame, inspired by the style of Hollow Knight. Explore a connected underground world, fight bugs and bosses, unlock new abilities, and find your way to the final boss.
 
 Everything is drawn with code (no image or audio files), and it all lives in a single file: `wonderous_soul.py`.
+
+<!-- Add a screenshot or GIF here, for example:
+![Gameplay](docs/screenshot.png)
+-->
 
 ## Requirements
 
@@ -39,7 +44,7 @@ pip3 install pygame-ce
 python3 wonderous_soul.py
 ```
 
-Press **Enter** on the title screen for a new game, or **C** to continue from your last save.
+Use the main menu to start a game: **Start** begins a new game in a save slot and **Continue** resumes your last one.
 
 ## Controls
 
@@ -55,7 +60,8 @@ Press **Enter** on the title screen for a new game, or **C** to continue from yo
 | Talk / use door / rest at bench | W or Up |
 | Buy from a shop | 1, 2, 3 |
 | World map | M |
-| Quit | Esc |
+| Charm menu (A/D to choose, Enter to equip) | I |
+| Pause menu | Esc |
 
 ## How to play
 
@@ -67,6 +73,23 @@ Press **Enter** on the title screen for a new game, or **C** to continue from yo
 - **Death:** you respawn at your last bench and leave a shade holding your Geo where you fell. Strike the shade with your nail to get it back.
 - **Doors:** some rooms have doorways. Press W at one to step through, since hidden areas are worth finding.
 - **Gates:** some exits stay sealed until you defeat the boss guarding them.
+
+## Charms
+
+Ten charms can be found in the Abyss or bought from merchants. Each one costs one or two **notches**, and you start with 4. Every boss you defeat grants one more notch, up to 11. Press **I** to open the charm menu and choose which to equip, so you can tune your build:
+
+| Charm | Effect |
+| --- | --- |
+| Heavy Nail | Much more nail damage |
+| Quick Slash | Swing far faster |
+| Soul Catcher | Extra Soul per hit |
+| Fragile Heart | +2 max health |
+| Swift Dash | Longer dash, faster recharge |
+| Long Nail | Extended reach |
+| Wind Stride | Run faster |
+| Focused Mind | Focus heals in under half a second |
+| Greed | 50% more Geo from enemies |
+| Stone Skin | Stay invulnerable longer after a hit |
 
 ## Saving
 
@@ -88,7 +111,18 @@ Merchants sell permanent upgrades for Geo: extra health, a sharper nail (more da
 
 ## Enemies and bosses
 
-Normal enemies include crawlers, flying insects, leaping hoppers, spitting plants, armored beetles, swooping bats, and ghosts that drift through walls. Three bosses block your progress: the **Husk Brute**, the **Crystal Weaver**, and the final boss, **The Warden**. After The Warden, a sealed gate opens into **The Abyss**, a generated underground of about 60 more rooms across four regions (Ashen Caverns, Glowmire Swamp, Bone Ruins, and Void Reach). Each region ends in a guardian boss, and the final boss waits at the bottom of the Void Reach. Defeat it to finish the game.
+Normal enemies include crawlers, flying insects, leaping hoppers, spitting plants, armored beetles, swooping bats, and ghosts that drift through walls. Three bosses block your progress: the **Husk Brute**, the **Crystal Weaver**, and the final boss, **The Warden**. After The Warden, a sealed gate opens into **The Abyss**, a generated underground of about 60 more rooms across four regions (Ashen Caverns, Glowmire Swamp, Bone Ruins, and Void Reach). Enemies get tougher and hit harder the deeper you go. Each region ends in a guardian boss, and the final boss waits at the bottom of the Void Reach. The final boss is **The Seraph**, a colossal angelic being that floats in the background. Watch for the warning beams before its lightning strikes, and strike the glowing sigil on its giant hands when they slam down and rest on the ground. Defeat it to finish the game.
+
+## Running the tests
+
+The tests run without a window (pygame is stubbed out), so they work anywhere:
+
+```
+pip install pytest
+pytest -q
+```
+
+You can also run `python tests/test_game.py` directly.
 
 ## Troubleshooting
 
@@ -96,6 +130,14 @@ Normal enemies include crawlers, flying insects, leaping hoppers, spitting plant
 - **"Python was not found" on Windows:** install Python from [python.org](https://www.python.org/downloads/) and tick "Add python.exe to PATH", or use `py` instead of `python`.
 - **"No such file" when running the game:** make sure your terminal is in the folder containing `wonderous_soul.py` (use `cd` to get there).
 - **Window doesn't appear or the game runs slowly:** close other heavy programs and make sure your graphics drivers are up to date.
+
+## Contributing
+
+Bug reports, ideas and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for how the code is organized and how to add rooms, monsters and charms, and [CHANGELOG.md](CHANGELOG.md) for the version history.
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 ## Credits
 
