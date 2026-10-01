@@ -1,6 +1,20 @@
+# Python
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+.pytest_cache/
+.venv/
 venv/
-.idea/
+env/
+build/
+dist/
+*.egg-info/
+
+# Game data created at runtime (saves and settings)
+wonderous_soul_save*.json
+wonderous_soul_settings.json
+
+# Editors and OS
 .vscode/
+.idea/
+.DS_Store
+Thumbs.db
