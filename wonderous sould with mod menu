@@ -1,0 +1,2507 @@
+"""Wonderous Soul - a Hollow Knight-inspired 2D action Metroidvania.
+Run:  pip install pygame  &&  python wonderous_soul.py
+
+Mechanics: nail slash (up/down/side), downward-strike pogo (enemies + spikes),
+Mothwing-style dash (ability gate), Soul from hits + hold-to-Focus heal,
+Geo currency, benches (rest / respawn), death "shade" you retrieve by striking it,
+connected rooms, patrol/flying enemies, and a boss.
+"""
+import sys, math, random, json, os, io, wave, struct
+import pygame
+
+W, H, T = 960, 544, 32
+SAVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wonderous_soul_save.json")
+SAVE_FILES = [SAVE, SAVE.replace(".json", "_2.json"), SAVE.replace(".json", "_3.json")]
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wonderous_soul_settings.json")
+MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")
+FINAL_BOSS_MUSIC = os.path.join(MUSIC_DIR, "blood_drain.mp3")
+FINAL_BOSS_MUSIC_OGG = os.path.join(MUSIC_DIR, "blood_drain.ogg")
+VERSION = "0.9"
+DEFAULT_SETTINGS = dict(shake=True, vignette=True, fps=False, fullscreen=False, diff="Normal", last_slot=0)
+
+
+# -----------------------------------------------------------------------------
+# Procedural SFX - generated at runtime, so no sound files are required.
+# These are original game-style effects made from simple tones/noise.
+# -----------------------------------------------------------------------------
+def _make_sfx(duration, start_hz, end_hz, volume=0.45, noise=0.0, attack=0.004, release=0.08):
+    if not pygame.mixer.get_init():
+        return None
+    rate = 22050
+    count = max(1, int(rate * duration))
+    frames = bytearray()
+    phase = 0.0
+    for i in range(count):
+        t = i / rate
+        q = i / max(1, count - 1)
+        hz = start_hz + (end_hz - start_hz) * q
+        phase += 2.0 * math.pi * hz / rate
+        tone = math.sin(phase)
+        # A second harmonic gives attacks a slightly metallic character.
+        tone += 0.22 * math.sin(phase * 2.03)
+        n = (random.random() * 2.0 - 1.0) * noise
+        env_a = min(1.0, t / max(attack, 0.0001))
+        env_r = min(1.0, (duration - t) / max(release, 0.0001))
+        env = max(0.0, min(1.0, env_a, env_r))
+        sample = int(max(-1.0, min(1.0, (tone + n) * volume * env)) * 32767)
+        frames += struct.pack('<h', sample)
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    buf.seek(0)
+    try:
+        return pygame.mixer.Sound(file=buf)
+    except Exception:
+        return None
+
+
+def _make_slash_sfx(duration=0.16, volume=0.52, heavy=False):
+    """Create a short, swooshing blade-slash sound in memory.
+
+    It uses a fast downward frequency sweep plus shaped noise, rather than
+    a simple beep, to give the attack a sharper air-cutting character.
+    """
+    if not pygame.mixer.get_init():
+        return None
+    rate = 22050
+    count = max(1, int(rate * duration))
+    frames = bytearray()
+    phase = 0.0
+    last_noise = 0.0
+    for i in range(count):
+        t = i / rate
+        q = i / max(1, count - 1)
+
+        # Very fast pitch sweep: high at the beginning, dropping as the
+        # blade travels through the air. Heavy attacks start lower and last longer.
+        start = 1700.0 if heavy else 2300.0
+        end = 180.0 if heavy else 260.0
+        hz = start * ((end / start) ** q)
+        phase += 2.0 * math.pi * hz / rate
+
+        # Filtered noise gives the sound its airy "whoosh" instead of a beep.
+        raw = random.random() * 2.0 - 1.0
+        last_noise = last_noise * 0.72 + raw * 0.28
+        noise_layer = (raw - last_noise * 0.45)
+
+        # Add a quieter metallic harmonic at the start of the swing.
+        tone = math.sin(phase) * 0.32 + math.sin(phase * 1.97) * 0.10
+
+        # Quick attack, strongest around the middle, then a smooth fade.
+        envelope = math.sin(math.pi * (q ** 0.72)) ** 0.72
+        if heavy:
+            envelope *= 1.10
+        sample = (tone + noise_layer * (1.15 if not heavy else 1.30)) * volume * envelope
+        sample = int(max(-1.0, min(1.0, sample)) * 32767)
+        frames += struct.pack('<h', sample)
+
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    buf.seek(0)
+    try:
+        return pygame.mixer.Sound(file=buf)
+    except Exception:
+        return None
+
+
+def _make_footstep_sfx(duration=0.075, volume=0.34):
+    """Create a tiny soft footstep: low thump + dusty noise, entirely in memory."""
+    if not pygame.mixer.get_init():
+        return None
+    rate = 22050
+    count = max(1, int(rate * duration))
+    frames = bytearray()
+    phase = 0.0
+    filtered = 0.0
+    for i in range(count):
+        t = i / rate
+        q = i / max(1, count - 1)
+        hz = 105.0 - 48.0 * q
+        phase += 2.0 * math.pi * hz / rate
+        raw = random.random() * 2.0 - 1.0
+        filtered = filtered * 0.78 + raw * 0.22
+        thump = math.sin(phase) * 0.72
+        dust = filtered * 0.42
+        env = (1.0 - q) ** 2.1
+        sample = int(max(-1.0, min(1.0, (thump + dust) * volume * env)) * 32767)
+        frames += struct.pack('<h', sample)
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    buf.seek(0)
+    try:
+        return pygame.mixer.Sound(file=buf)
+    except Exception:
+        return None
+
+
+def _make_jump_sfx(duration=0.16, volume=0.42):
+    """Create a light airy jump/launch sound in memory."""
+    if not pygame.mixer.get_init():
+        return None
+    rate = 22050
+    count = max(1, int(rate * duration))
+    frames = bytearray()
+    phase1 = phase2 = 0.0
+    for i in range(count):
+        q = i / max(1, count - 1)
+        # Rising pitch gives a small upward "fwoop" rather than a beep.
+        hz1 = 240.0 + 760.0 * q
+        hz2 = 520.0 + 900.0 * q
+        phase1 += 2.0 * math.pi * hz1 / rate
+        phase2 += 2.0 * math.pi * hz2 / rate
+        raw = random.random() * 2.0 - 1.0
+        env = math.sin(math.pi * (q ** 0.55)) ** 0.8
+        sample = (math.sin(phase1) * 0.55 + math.sin(phase2) * 0.16 + raw * 0.10) * volume * env
+        frames += struct.pack('<h', int(max(-1.0, min(1.0, sample)) * 32767))
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(frames)
+    buf.seek(0)
+    try:
+        return pygame.mixer.Sound(file=buf)
+    except Exception:
+        return None
+
+
+def make_game_sfx():
+    """Create all gameplay SFX in memory; nothing is written to disk."""
+    return {
+        "slash": _make_slash_sfx(0.15, 0.58, False),
+        "slash_heavy": _make_slash_sfx(0.19, 0.64, True),
+        "hit": _make_sfx(0.10, 240, 95, 0.48, 0.45, 0.001, 0.06),
+        "dash": _make_sfx(0.16, 120, 850, 0.24, 0.75, 0.002, 0.12),
+        "hurt": _make_sfx(0.20, 180, 70, 0.40, 0.35, 0.003, 0.10),
+        "focus": _make_sfx(0.45, 260, 900, 0.22, 0.04, 0.01, 0.16),
+        "heal": _make_sfx(0.28, 650, 1100, 0.25, 0.02, 0.005, 0.12),
+        "pogo": _make_sfx(0.11, 420, 120, 0.34, 0.35, 0.001, 0.06),
+        "step": _make_footstep_sfx(),
+        "jump": _make_jump_sfx(),
+    }
+SETTINGS = dict(DEFAULT_SETTINGS)
+DIFF = {"Easy": (0.75, -1, 1.3), "Normal": (1.0, 0, 1.0), "Hard": (1.3, 0, 0.75)}   # hp mult, damage delta, i-frame mult
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE) as fh: SETTINGS.update(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    if SETTINGS.get("diff") not in DIFF: SETTINGS["diff"] = "Normal"
+
+
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, "w") as fh: json.dump(SETTINGS, fh)
+    except OSError:
+        pass
+
+
+def slot_info(i):
+    try:
+        with open(SAVE_FILES[i]) as fh: d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    ri = (d.get("spawn") or [0])[0]
+    return dict(room=ROOMS[ri]["name"] if isinstance(ri, int) and 0 <= ri < len(ROOMS) else "Unknown",
+                geo=d.get("geo", 0), hp=d.get("maxhp", 5),
+                abil=sum(bool(d.get(k)) for k in ("dash", "wings", "claw")),
+                charms=len(d.get("charms", [])), bosses=len(d.get("dead", [])),
+                explored=int(100 * len(d.get("visited", [])) / max(1, len(ROOMS))),
+                time=int(d.get("playtime", 0)))
+
+
+CONTROLS = [("Move", "A / D   or   Left / Right"), ("Jump (hold = higher)", "Space / Z"),
+            ("Double jump / wall jump", "Press jump again / jump on a wall"), ("Nail attack", "X / J"),
+            ("Strike upward", "Hold W / Up + attack"), ("Downward strike (pogo)", "Hold S / Down in the air + attack"),
+            ("Dash", "C / Left Shift / L"), ("Focus (heal)", "Hold F  (needs 33 Soul)"),
+            ("Talk / door / bench", "W / Up"), ("Buy in shops", "1 / 2 / 3"), ("World map", "M"),
+            ("Charms", "I"), ("Pause menu", "Esc")]
+CREDITS = ["WONDEROUS SOUL", "Version " + VERSION, "", "Created with Claude, made by Anthropic", "",
+           "Built with Python and pygame", "", "Inspired by Hollow Knight by Team Cherry.",
+           "A fan-inspired project. It is not affiliated with or endorsed by them,",
+           "and uses no assets from that game. All art is drawn in code.", "", "Thanks for playing!"]
+CHANGELOG = [
+    ("0.9", "Main Menu", ["New main menu with Start, Continue, Saves, Settings, Controls, Changelog, Credits and Quit.",
+                          "Three save slots with a summary of each: location, abilities, charms, bosses, exploration and play time.",
+                          "Settings for difficulty, screen shake, vignette, FPS counter and fullscreen, remembered between sessions.",
+                          "Pause menu on Esc."]),
+    ("0.8", "The Seraph", ["New final boss: a colossal angelic being that floats in the background.",
+                           "Lightning bolts are telegraphed with warning beams before they strike.",
+                           "Giant hands slam down. While one rests on the ground its sigil can be struck to hurt the Seraph.",
+                           "Three phases that add halo rings of light and sweeping judgement bolts."]),
+    ("0.7", "Charms", ["Ten equippable charms and a notch system. Bosses grant extra notches.",
+                       "Enemies grow tougher and hit harder in deeper regions."]),
+    ("0.6", "The Abyss", ["After the Warden, a gate opens into about 60 generated rooms in four regions with guardian bosses.",
+                          "Save and load, plus a world map that scales to the full world."]),
+    ("0.5", "Polish and fixes", ["Fixed Focus not working: the ground check flickered while standing still.",
+                                 "Walking now uses a proper two-bone leg animation.",
+                                 "Jumps use squash and stretch with a little float at the top."]),
+    ("0.4", "Expansion", ["World grew to 14 connected rooms with doors, benches and a map.",
+                          "NPCs, shops, and upgrades for Geo.",
+                          "New monsters: spitters, hoppers, armored beetles, bats and ghosts.",
+                          "New abilities: dash, double jump and wall cling.",
+                          "Bosses: the Husk Brute, the Crystal Weaver and the Warden."]),
+    ("0.3", "Look and feel", ["A flowing cape, textured stone and moss, a parallax cave background,",
+                              "glowing props, lanterns and a vignette.",
+                              "More lifelike monster art."]),
+    ("0.2", "Bug fixes", ["Fixed a crash on starting a game and a key lookup crash."]),
+    ("0.1", "First playable", ["Nail combat with pogo, dash, Soul and Focus healing, Geo, benches, death shades,",
+                               "three rooms and the first boss."]),
+]
+
+
+def build_changelog(font):
+    out = []
+    for ver, title, notes in CHANGELOG:
+        out.append(("h", "v" + ver + "  -  " + title))
+        for n in notes:
+            for k, ln in enumerate(wrap(font, n, 740)): out.append(("t", ("•  " if k == 0 else "     ") + ln))
+        out.append(("t", ""))
+    return out
+GRAV, MAXFALL, NAIL = 2200, 900, 5
+
+
+# ------------------------------------------------------------------ world
+FLYERS = {"fly", "bat", "ghost", "weaver"}
+BOSSES = {"boss", "weaver", "warden", "seraph"}
+HEAVY = BOSSES | {"tank"}
+BOSS_NAME = {"boss": "HUSK BRUTE", "weaver": "CRYSTAL WEAVER", "warden": "THE WARDEN", "seraph": "THE SERAPH"}
+BOSS_MSG = {"boss": "The Husk Brute crumbles... the way east opens.",
+            "weaver": "The Crystal Weaver shatters... the way forward opens.",
+            "warden": "The Warden falls.",
+            "seraph": "The Seraph dissolves into pure light..."}
+ICON = {"cloak": (120, 220, 255), "wings": (255, 240, 150), "claw": (255, 140, 120),
+        "mask": (240, 240, 250), "geocache": (240, 200, 90), "charm": (255, 170, 230)}
+ITEM_MSG = {"cloak": "Mothwing Cloak acquired!  Press C / Shift to dash.",
+            "wings": "Monarch Wings acquired!  Press jump again in mid-air.",
+            "claw": "Mantis Claw acquired!  Press toward a wall to cling, jump to leap off.",
+            "mask": "Mask Shard found!  Max health increased.",
+            "geocache": "A hidden cache!  +150 Geo."}
+
+
+def mkroom(name, w, plats=(), pits=(), spikes=(), left=True, right=True, benches=(), spawns=(),
+           items=(), blocks=(), gates=(), npcs=(), doors=()):
+    solid, sp = set(), set(spikes)
+    for x in range(w):
+        solid.add((x, 0))
+        for y in (15, 16):
+            if any(a <= x <= b for a, b in pits):
+                if y == 16:
+                    sp.add((x, 16))
+            else:
+                solid.add((x, y))
+    for y in range(17):
+        if not (left and 11 <= y <= 14): solid.add((0, y))
+        if not (right and 11 <= y <= 14): solid.add((w - 1, y))
+    for x, y, n in plats:
+        for i in range(n): solid.add((x + i, y))
+    for bx, by, bw, bh in blocks:
+        for i in range(bw):
+            for j in range(bh): solid.add((bx + i, by + j))
+    return dict(name=name, w=w, solid=solid, spikes=sp, benches=list(benches), spawns=list(spawns),
+                items=list(items), gates=list(gates), npcs=list(npcs), doors=list(doors))
+
+
+def npc(name, look, x, y, lines, shop=None):
+    return dict(name=name, look=look, x=x, y=y, lines=lines, shop=shop)
+
+
+def door(x, y, to, tx, ty):
+    return dict(x=x, y=y, to=to, tx=tx, ty=ty)
+
+
+ROOMS = [
+    # 0
+    mkroom("Forgotten Crossing", 50, plats=[(9, 12, 5), (19, 10, 6), (30, 12, 5), (38, 9, 4)], left=False,
+           benches=[(4, 14)], items=[("cloak", 45, 14)],
+           npcs=[npc("Wanderer", "elder", 7, 14, [
+               "Ah, a new wanderer. The hollow below stirs again...",
+               "Strike with X, leap with Space. Hold W while striking to hit upward, and S in mid-air to pogo off foes and spikes.",
+               "Rest on benches with W. If you fall, your shade keeps your Geo - strike it to reclaim what you lost.",
+               "Beyond the chasm lies a cloak of moth-silk. Find it and you can cross. Press M for your map."])],
+           spawns=[("crawl", 14, 14), ("crawl", 26, 14), ("crawl", 40, 14), ("fly", 22, 7)]),
+    # 1
+    mkroom("Shattered Chasm", 60, pits=[(20, 28)], plats=[(12, 11, 4), (45, 10, 5)], benches=[(6, 14)],
+           spawns=[("crawl", 36, 14), ("fly", 34, 8), ("fly", 50, 7), ("crawl", 52, 14),
+                   ("hopper", 40, 14), ("spitter", 56, 14)]),
+    # 2
+    mkroom("Brute Arena", 32, plats=[(4, 11, 4), (24, 11, 4)], gates=[(31, 11, 1, 4, (2, 0))],
+           spawns=[("boss", 22, 12)]),
+    # 3
+    mkroom("Fungal Gully", 70, plats=[(10, 12, 5), (22, 10, 6), (34, 12, 4), (48, 9, 5)], benches=[(4, 14)],
+           npcs=[npc("Sly the Merchant", "merchant", 9, 14, [
+                     "Geo for goods, friend. Sly's prices are fair. Mostly."],
+                     shop=[("Mask Shard", 100, "mask", 2), ("Nail Sharpening", 150, "nail", 3),
+                           ("Charm: Greed", 90, "charm:greed", 1)]),
+                 npc("Wren the Hunter", "hunter", 30, 14, [
+                     "You felled the Husk Brute? Good. It guarded this passage for an age.",
+                     "East, the vines grow thick. Some ledges are too high to reach... unless you have wings.",
+                     "There is a shrine hidden in the gully wall. Look for a doorway and press W."])],
+           doors=[door(44, 14, 4, 2, 14), door(66, 14, 8, 2, 14)],
+           spawns=[("crawl", 16, 14), ("hopper", 26, 14), ("spitter", 38, 14), ("fly", 48, 6),
+                   ("crawl", 54, 14), ("hopper", 58, 14)]),
+    # 4
+    mkroom("Wing Shrine", 28, plats=[(10, 11, 3), (16, 11, 3)], left=False, right=False, benches=[(8, 14)],
+           items=[("wings", 14, 14)], doors=[door(2, 14, 3, 44, 14)],
+           npcs=[npc("Moth Sage", "elder", 21, 14, [
+               "You found the shrine. The Monarch's wings are yours to take.",
+               "Press jump again in mid-air to soar a second time.",
+               "With them you may reach the high ledges east of the gully - and there lies the Mantis Claw."])]),
+    # 5
+    mkroom("Overgrown Ascent", 72, plats=[(10, 12, 4), (24, 11, 5), (44, 9, 6)], benches=[(5, 14)],
+           items=[("claw", 47, 8)],
+           npcs=[npc("Tuk", "child", 19, 14, [
+               "Ooh! Are you a knight? The hoppers are scary...",
+               "I saw shiny claws on that tall ledge. Too high for me!"])],
+           spawns=[("hopper", 14, 14), ("spitter", 30, 14), ("crawl", 36, 14), ("bat", 40, 1),
+                   ("bat", 52, 1), ("tank", 58, 14), ("fly", 62, 6), ("spitter", 66, 14)]),
+    # 6
+    mkroom("Claw Chimney", 56, plats=[(4, 11, 4)], blocks=[(28, 7, 2, 8), (34, 4, 2, 11)],
+           benches=[(40, 14)],
+           spawns=[("crawl", 8, 14), ("hopper", 16, 14), ("spitter", 23, 14), ("bat", 31, 1),
+                   ("tank", 44, 14), ("spitter", 50, 14)]),
+    # 7
+    mkroom("Deepnest Tunnels", 84, pits=[(30, 37)], plats=[(12, 11, 4), (20, 9, 4), (46, 12, 5), (58, 10, 6), (70, 12, 4)],
+           spikes=[(54, 14), (55, 14), (56, 14)], benches=[(44, 14)],
+           npcs=[npc("Old Tracker", "hunter", 41, 14, [
+               "Deepnest is no place for the unwary. Bats swoop from above and ghosts drift through solid stone.",
+               "Behind you, a pit too wide to leap. Dash or fly across it.",
+               "Crystal Peak lies beyond, and at its end the Weaver nests."])],
+           spawns=[("crawl", 10, 14), ("bat", 16, 1), ("bat", 24, 1), ("ghost", 50, 6), ("tank", 62, 14),
+                   ("hopper", 66, 14), ("spitter", 72, 14), ("ghost", 76, 7), ("bat", 70, 1)]),
+    # 8
+    mkroom("Hidden Cellar", 26, left=False, right=False, benches=[(7, 14)],
+           items=[("geocache", 21, 14)], doors=[door(2, 14, 3, 66, 14)],
+           npcs=[npc("Grim", "merchant", 13, 14, [
+               "Few find this cellar. Care to buy something rare?"],
+               shop=[("Quick Focus", 120, "focus", 1), ("Soul Catcher", 150, "soul", 2),
+                     ("Charm: Quick Slash", 130, "charm:quick_slash", 1)])]),
+    # 9
+    mkroom("Crystal Peak", 80, plats=[(10, 12, 4), (18, 10, 4), (26, 8, 4), (34, 6, 5), (44, 8, 4),
+                                       (52, 10, 4), (60, 12, 4), (68, 11, 5)],
+           benches=[(76, 14)], doors=[door(37, 5, 13, 2, 14)],
+           npcs=[npc("Pilgrim", "elder", 5, 14, [
+               "Climb the crystal stair, friend. Near the top, a vault hides from the world."])],
+           spawns=[("fly", 20, 5), ("fly", 40, 4), ("bat", 30, 1), ("ghost", 50, 5), ("hopper", 12, 14),
+                   ("spitter", 46, 14), ("tank", 66, 14), ("crawl", 24, 14), ("fly", 72, 6), ("bat", 56, 1)]),
+    # 10
+    mkroom("Weaver's Lair", 40, plats=[(6, 10, 5), (29, 10, 5)], benches=[(3, 14)],
+           gates=[(39, 11, 1, 4, (10, 0))], spawns=[("weaver", 18, 5)]),
+    # 11
+    mkroom("Sunken Halls", 90, pits=[(22, 28), (58, 63)],
+           plats=[(14, 11, 4), (36, 12, 5), (44, 9, 5), (52, 11, 3), (72, 10, 4), (80, 12, 4)],
+           spikes=[(40, 14), (41, 14), (66, 14), (67, 14), (68, 14)], benches=[(5, 14)],
+           npcs=[npc("Last Sentinel", "hunter", 86, 14, [
+               "The Warden waits beyond. None have returned.",
+               "If you fall, rest at a bench and try again. That is all the wisdom I have left."])],
+           spawns=[("ghost", 18, 6), ("ghost", 48, 5), ("bat", 32, 1), ("bat", 35, 1), ("tank", 46, 14),
+                   ("hopper", 50, 14), ("spitter", 73, 14), ("crawl", 84, 14), ("ghost", 80, 6),
+                   ("spitter", 12, 14)]),
+    # 12
+    mkroom("Warden's Sanctum", 38, plats=[(6, 11, 4), (28, 11, 4)], benches=[(3, 14)], gates=[(37, 11, 1, 4, (12, 0))],
+           spawns=[("warden", 26, 14)]),
+    # 13
+    mkroom("Crystal Vault", 24, left=False, right=False, benches=[(6, 14)],
+           items=[("mask", 12, 14)], doors=[door(2, 14, 9, 37, 5)],
+           npcs=[npc("Crystal Hermit", "hermit", 18, 14, [
+               "Hehe... a visitor. Take the mask shard, it hums for you.",
+               "They say the Warden once wore a mask just like yours."])]),
+]
+LINKS = {(0, "R"): 1, (1, "L"): 0, (1, "R"): 2, (2, "L"): 1, (2, "R"): 3, (3, "L"): 2, (3, "R"): 5,
+         (5, "L"): 3, (5, "R"): 6, (6, "L"): 5, (6, "R"): 7, (7, "L"): 6, (7, "R"): 9, (9, "L"): 7,
+         (9, "R"): 10, (10, "L"): 9, (10, "R"): 11, (11, "L"): 10, (11, "R"): 12, (12, "L"): 11}
+MAP_POS = [(0, 1), (1, 1), (2, 1), (3, 1), (3, 0), (4, 1), (5, 1), (6, 1), (3, 2), (7, 1), (8, 1),
+           (9, 1), (10, 1), (7, 0)]
+CHARMS = {
+    "heavy_nail": dict(name="Heavy Nail", cost=2, desc="Your nail strikes hit much harder."),
+    "quick_slash": dict(name="Quick Slash", cost=1, desc="Swing your nail far faster."),
+    "soul_catch": dict(name="Soul Catcher", cost=1, desc="Gain extra Soul with every hit."),
+    "fragile_heart": dict(name="Fragile Heart", cost=2, desc="+2 max health while equipped."),
+    "swift_dash": dict(name="Swift Dash", cost=1, desc="Dash longer and recharge faster."),
+    "long_nail": dict(name="Long Nail", cost=1, desc="Extends the reach of your nail."),
+    "wind_stride": dict(name="Wind Stride", cost=1, desc="Run faster."),
+    "quick_focus": dict(name="Focused Mind", cost=2, desc="Heal with Focus in under half a second."),
+    "greed": dict(name="Greed", cost=1, desc="Enemies drop 50% more Geo."),
+    "stone_skin": dict(name="Stone Skin", cost=2, desc="Stay invulnerable much longer after a hit."),
+}
+ROOM_DEPTH = {}
+GEN_CHARMS = []
+REGIONS = [
+    ("Ashen Caverns", (255, 110, 50), ["crawl", "hopper", "bat", "spitter", "tank"], "boss", 12),
+    ("Glowmire Swamp", (60, 255, 150), ["hopper", "spitter", "fly", "ghost", "crawl"], "weaver", 14),
+    ("Bone Ruins", (225, 225, 200), ["tank", "bat", "ghost", "spitter", "hopper"], "warden", 16),
+    ("Void Reach", (150, 90, 255), ["ghost", "bat", "tank", "fly", "hopper", "spitter"], "warden", 18),
+]
+LORE = ["The deeper you go, the quieter the bugs become.",
+        "I lost my lantern here. Or perhaps it lost me.",
+        "Every region ends in a guardian. Rest before you face it.",
+        "The Warden was only the first gate.",
+        "Geo means nothing down here, yet I cannot stop counting it.",
+        "Hollow things hum when a true knight passes.",
+        "Mind the spikes. They were not always so hungry.",
+        "Some say the Void Reach has no bottom.",
+        "Keep your Soul high. A quick heal saves a long walk.",
+        "I can hear something vast breathing below the stone."]
+NPC_NAMES = ["Drifter", "Lost Pilgrim", "Old Bug", "Ashen Hermit", "Mossback", "Faded Scout"]
+
+
+def gen_room(rng, rname, ri, k, pool, tint, gid):
+    w = rng.randint(60, 100)
+    kind = rng.choice(("hops", "pits", "gauntlet", "pillars"))
+    plats, pits, spikes, blocks = [], [], [], []
+    x = 12
+    if kind == "hops":
+        row = 12
+        while x < w - 14:
+            n = rng.randint(3, 6); plats.append((x, row, n)); x += n + rng.randint(2, 4)
+            row = max(5, min(12, row + rng.choice((-2, -1, 0, 1, 2))))
+    elif kind == "pits":
+        while x < w - 20:
+            pw = rng.randint(4, 7); pits.append((x, x + pw - 1))
+            if pw >= 6 and rng.random() < 0.6: plats.append((x + pw // 2 - 1, 12, 2))
+            x += pw + rng.randint(7, 11)
+    elif kind == "gauntlet":
+        while x < w - 16:
+            sw = rng.randint(2, 3); spikes += [(x + i, 14) for i in range(sw)]
+            x += sw + rng.randint(6, 10)
+    else:
+        while x < w - 14:
+            h = rng.randint(2, 5); blocks.append((x, 15 - h, 2, h)); x += 2 + rng.randint(6, 10)
+    bad = set()
+    for a, b in pits: bad |= set(range(a - 1, b + 2))
+    for bx, by, bw, bh in blocks: bad |= set(range(bx - 1, bx + bw + 1))
+    for sx, sy in spikes: bad |= {sx - 1, sx, sx + 1}
+    cols = [c for c in range(9, w - 9) if c not in bad]
+    spawns = []
+    for _ in range(w // 10 + ri + (3 if kind == "gauntlet" else 0)):
+        kd, c = rng.choice(pool), rng.choice(cols)
+        if kd in ("fly", "ghost"): spawns.append((kd, c, rng.randint(2, 4)))
+        elif kd == "bat": spawns.append((kd, c, 1))
+        else: spawns.append((kd, c, 14))
+    npcs = []
+    if k % 5 == 2:
+        npcs.append(npc(rng.choice(NPC_NAMES), rng.choice(("elder", "hunter", "child", "hermit")), w - 7, 14,
+                        [rng.choice(LORE), rng.choice(LORE)]))
+    if k % 7 == 4:
+        npcs.append(npc("Wandering Trader", "merchant", 7, 14, ["Rare wares from the deep. Take a look."],
+                        shop=[("Mask Shard", 100, "mask", 2), ("Nail Sharpening", 150, "nail", 3)]))
+    items = []
+    if rng.random() < 0.3: items.append(("geocache%d" % gid, rng.choice(cols), 14))
+    if k % 9 == 6: items.append(("mask%d" % gid, rng.choice(cols), 14))
+    if k in (5, 9) and GEN_CHARMS: items.append(("charm:" + GEN_CHARMS.pop(), rng.choice(cols), 14))
+    room = mkroom("%s %d" % (rname, k + 1), w, plats=plats, pits=pits, spikes=spikes, blocks=blocks,
+                  benches=[(4, 14)] if k % 3 == 0 else [], spawns=spawns, items=items, npcs=npcs)
+    room["tint"] = tint
+    return room
+
+
+def gen_boss_room(rname, tint, bkind, gid, is_last):
+    if is_last:
+        room = mkroom("The Celestial Court", 50, plats=[(6, 11, 5), (22, 9, 6), (40, 11, 5)], right=False,
+                      benches=[(3, 14)], spawns=[("seraph", 25, 3)])
+        room["tint"] = (255, 235, 170)
+        return room
+    spawn = {"boss": ("boss", 22, 12), "weaver": ("weaver", 18, 5), "warden": ("warden", 26, 14)}[bkind]
+    room = mkroom(rname + " Guardian", 38, plats=[(6, 11, 4), (28, 11, 4)], right=not is_last,
+                  benches=[(3, 14)], gates=[] if is_last else [(37, 11, 1, 4, (gid, 0))], spawns=[spawn])
+    room["tint"] = tint
+    return room
+
+
+def gen_world(seed=1234):
+    rng = random.Random(seed)
+    prev, final = 12, None
+    GEN_CHARMS[:] = sorted(c for c in CHARMS if c not in ("greed", "quick_slash")); rng.shuffle(GEN_CHARMS)
+    for ri, (rname, tint, pool, bkind, count) in enumerate(REGIONS):
+        for k in range(count):
+            gid = len(ROOMS)
+            ROOM_DEPTH[gid] = ri + 1
+            last = k == count - 1
+            ROOMS.append(gen_boss_room(rname, tint, bkind, gid, ri == len(REGIONS) - 1) if last
+                         else gen_room(rng, rname, ri, k, pool, tint, gid))
+            MAP_POS.append((k, 3 + ri))
+            LINKS[(prev, "R")] = gid; LINKS[(gid, "L")] = prev; prev = gid
+            if last: final = (gid, 0)
+    return final
+
+
+GEN_FINAL = gen_world()
+BOSS_IDS = {(i, n) for i, r in enumerate(ROOMS) for n, sp in enumerate(r["spawns"]) if sp[0] in BOSSES}
+FINAL_ID = GEN_FINAL
+
+
+def solids(room, r):
+    out = []
+    for cx in range(r.left // T, (r.right - 1) // T + 1):
+        for cy in range(r.top // T, (r.bottom - 1) // T + 1):
+            if (cx, cy) in room["solid"]:
+                out.append(pygame.Rect(cx * T, cy * T, T, T))
+    return out
+
+
+class Body:
+    def __init__(s, x, y, w, h):
+        s.x, s.y, s.w, s.h = x, y, w, h
+        s.vx = s.vy = 0
+        s.ground, s.wall = False, 0
+
+    @property
+    def rect(s):
+        return pygame.Rect(int(s.x), int(s.y), s.w, s.h)
+
+    def move(s, room, dt, grav=True):
+        if grav: s.vy = min(s.vy + GRAV * dt, MAXFALL)
+        s.wall, s.ground = 0, False
+        s.x += s.vx * dt
+        r, hit = s.rect, False
+        for t in solids(room, r):
+            hit = True
+            if s.vx > 0: r.right = t.left; s.wall = 1
+            elif s.vx < 0: r.left = t.right; s.wall = -1
+        if hit: s.x = r.x
+        vy0 = s.vy
+        s.y += s.vy * dt
+        r, hit = s.rect, False
+        for t in solids(room, r):
+            hit = True
+            if vy0 > 0: r.bottom = t.top; s.ground = True
+            elif vy0 < 0: r.top = t.bottom
+        if hit: s.y = r.y; s.vy = 0
+        if not s.ground and s.vy >= 0 and solids(room, s.rect.move(0, 1)):
+            s.ground = True; s.vy = 0
+
+
+class Player(Body):
+    def __init__(s):
+        super().__init__(0, 0, 24, 44)
+        s.face, s.hp, s.maxhp, s.soul, s.geo = 1, 5, 5, 0, 0
+        s.iframes = s.knock = s.dash_cd = s.atk_cd = s.focus = s.buf = s.coyote = s.dashing = 0
+        s.air_dash, s.jumping, s.has_dash = True, False, False
+        s.has_wings = s.has_claw = False; s.air_jumps = 1; s.wj = 0
+        s.land_t = s.land_amt = s.jump_t = 0.0
+        s.slash, s.safe = None, (0, 0)
+        s.cape, s.walk_t = None, 0.0
+        s.last_step_cycle = -1
+
+
+class Enemy(Body):
+    STATS = {"crawl": (34, 22, 10, 1, 3), "fly": (28, 28, 10, 1, 5), "boss": (80, 90, 120, 2, 60),
+             "spitter": (30, 38, 15, 1, 6), "hopper": (32, 26, 15, 1, 6), "tank": (48, 34, 30, 1, 12),
+             "bat": (26, 22, 10, 1, 5), "ghost": (26, 36, 20, 1, 10),
+             "weaver": (70, 60, 160, 2, 120), "warden": (90, 100, 220, 2, 200), "seraph": (8, 8, 360, 2, 500)}
+
+    def __init__(s, kind, cx, cy, eid):
+        w, h, s.hp, s.dmg, s.geo = Enemy.STATS[kind]
+        dep = ROOM_DEPTH.get(eid[0], 0)
+        if kind != "seraph": s.hp = int(s.hp * (1 + 0.35 * dep))
+        s.geo = int(s.geo * (1 + 0.3 * dep))
+        if dep >= 3 and kind not in BOSSES: s.dmg = 2
+        s.hp = max(1, int(s.hp * DIFF[SETTINGS["diff"]][0]))
+        s.maxhp = s.hp
+        super().__init__(cx * T, cy * T if kind in FLYERS else (cy + 1) * T - h, w, h)
+        s.kind, s.id, s.flash, s.stun = kind, eid, 0, 0
+        s.dir, s.t, s.state, s.cycle, s.age = -1, 1.0, "idle", 0, random.random() * 6
+        s.face = -1; s.home = (s.x, s.y); s.cd = 0
+        if kind == "bat": s.state = "hang"
+        if kind == "spitter": s.t = 1.0 + random.random()
+        if kind == "hopper": s.t = random.random() * 1.5
+        if kind == "seraph":
+            s.ax = cx * T + 16
+            s.x = s.y = -5000.0
+            s.phase, s.state, s.cool, s.t, s.intro_said = 1, "intro", 2.0, 3.0, False
+            s.sched, s.bolts, s.hands = [], [], []
+
+    def add_bolt(s, x, warn):
+        s.bolts.append(dict(x=x, warn=warn, t=0.0, state="warn"))
+
+    def add_hand(s, x):
+        s.hands.append(dict(x=x, y=-260.0, t=0.0, state="warn"))
+
+    def ring(s, g):
+        rot = random.random() * 6.28
+        for i in range(14):
+            a = rot + i * math.tau / 14
+            g.shots.append([s.ax, 110, math.cos(a) * 250, 4.5, math.sin(a) * 250, "holy"])
+
+    def seraph_ai(s, g, dt):
+        p, rw = g.p, g.room["w"] * T
+        s.x = s.y = -5000.0
+        ph = 1 if s.hp > s.maxhp * 0.66 else (2 if s.hp > s.maxhp * 0.33 else 3)
+        warn = {1: 1.0, 2: 0.8, 3: 0.65}[s.phase]
+        if s.state == "intro":
+            if not s.intro_said:
+                s.intro_said = True; g.say("A vast light opens its eyes...", 3)
+            s.t -= dt
+            if s.t <= 0: s.state, s.cool = "fight", 1.0
+            return
+        if s.state == "phase":
+            s.t -= dt
+            if s.t <= 0: s.state, s.cool = "fight", 1.2
+            return
+        if ph > s.phase:
+            s.phase, s.state, s.t = ph, "phase", 2.5
+            s.sched, s.bolts, s.hands = [], [], []
+            g.shake = 0.6
+            g.say("JUDGEMENT DRAWS NEAR!" if ph == 3 else "The light grows fierce...", 3)
+            return
+        for it in list(s.sched):
+            it[0] -= dt
+            if it[0] <= 0:
+                s.sched.remove(it); it[1]()
+        for b in list(s.bolts):
+            b["t"] += dt
+            if b["state"] == "warn" and b["t"] >= b["warn"]:
+                b["state"], b["t"] = "strike", 0.0
+                g.shake = max(g.shake, 0.12)
+            elif b["state"] == "strike":
+                if abs(p.x + p.w / 2 - b["x"]) < 30 and g.state == "play": g.hurt(2, b["x"])
+                if b["t"] >= 0.22: s.bolts.remove(b)
+        floor = 15 * T
+        for h in list(s.hands):
+            h["t"] += dt
+            if h["state"] == "warn":
+                if h["t"] >= 1.0: h["state"], h["t"] = "fall", 0.0
+            elif h["state"] == "fall":
+                h["y"] += 2400 * dt
+                if g.state == "play" and p.rect.colliderect(pygame.Rect(int(h["x"]) - 75, int(h["y"]), 150, 170).inflate(-20, -10)):
+                    g.hurt(2, h["x"])
+                if h["y"] + 170 >= floor:
+                    h["y"] = floor - 170; h["state"], h["t"] = "rest", 0.0
+                    g.shake = 0.4
+                    for d in (-1, 1): g.shots.append([h["x"], floor - 22, d * 360, 1.8, 0, "wave"])
+            elif h["state"] == "rest":
+                if h["t"] >= 3.2: h["state"], h["t"] = "rise", 0.0
+            else:
+                h["y"] -= 900 * dt
+                if h["y"] < -260: s.hands.remove(h)
+        s.cool -= dt
+        if s.cool <= 0 and not s.sched:
+            opts = ["track", "row", "hand"]
+            if s.phase >= 2: opts.append("rings")
+            if s.phase >= 3: opts.append("sweep")
+            if any(h["state"] in ("warn", "fall", "rest") for h in s.hands): opts.remove("hand")
+            a = random.choice(opts)
+            cx = p.x + p.w / 2
+            if a == "track":
+                n = 3 if s.phase == 1 else 5
+                for i in range(n):
+                    s.sched.append([i * 0.5, lambda: s.add_bolt(p.x + p.w / 2, warn)])
+                s.cool = 1.8 + n * 0.5
+            elif a == "row":
+                c, gap = int(cx // 160) * 160, random.randint(-2, 2)
+                for k in range(-3, 4):
+                    if k != gap: s.add_bolt(max(40, min(rw - 40, c + k * 160 + 80)), warn + 0.25)
+                s.cool = 3.0
+            elif a == "hand":
+                xs = [cx]
+                if s.phase >= 2: xs.append(cx + random.choice((-320, 320)))
+                for x in xs: s.add_hand(max(120, min(rw - 120, x)))
+                s.cool = 5.0
+            elif a == "rings":
+                for i in range(2): s.sched.append([i * 1.0, lambda: s.ring(g)])
+                s.cool = 4.0
+            else:
+                cols = list(range(60 + random.randint(0, 80), int(rw) - 60, 140))
+                if random.random() < 0.5: cols.reverse()
+                for i, x in enumerate(cols): s.sched.append([i * 0.14, (lambda x=x: s.add_bolt(x, warn))])
+                s.cool = 2.0 + len(cols) * 0.14
+            if s.phase == 3: s.cool *= 0.8
+
+    def update(s, g, dt):
+        p, room = g.p, g.room
+        s.flash = max(0, s.flash - dt); s.age += dt
+        if s.stun > 0:
+            s.stun -= dt; s.vx *= 0.92
+            s.move(room, dt, s.kind not in FLYERS); return
+        if s.kind == "crawl":
+            r = s.rect
+            ax = r.right + 2 if s.dir > 0 else r.left - 2
+            if s.wall or (ax // T, (r.bottom + 2) // T) not in room["solid"]:
+                s.dir *= -1
+            s.vx = 60 * s.dir
+            s.move(room, dt)
+        elif s.kind == "fly":
+            dx, dy = p.x - s.x, p.y - s.y
+            d = math.hypot(dx, dy) or 1
+            tvx, tvy = (dx / d * 130, dy / d * 130) if d < 330 else (0, 0)
+            tvy += math.sin(s.age * 4) * 40
+            s.vx += (tvx - s.vx) * min(1, 4 * dt)
+            s.vy += (tvy - s.vy) * min(1, 4 * dt)
+            s.move(room, dt, False)
+        elif s.kind == "spitter":
+            s.face = 1 if p.x > s.x else -1
+            s.t -= dt
+            if s.t <= 0:
+                s.t = 2.2
+                if abs(p.x - s.x) < 460 and abs(p.y - s.y) < 320:
+                    vx = max(-300, min(300, (p.x - s.x) * 0.85))
+                    g.shots.append([s.rect.centerx + s.face * 8, s.y + 8, vx, 3.0, -420, "spit"])
+            s.move(room, dt)
+        elif s.kind == "hopper":
+            s.face = 1 if p.x > s.x else -1
+            if s.ground:
+                s.vx = 0; s.t -= dt
+                if s.t <= 0:
+                    near = abs(p.x - s.x) < 420
+                    s.vy, s.vx = -620, (s.face if near else random.choice((-1, 1))) * 210
+                    s.t = random.uniform(0.9, 1.5)
+            s.move(room, dt)
+        elif s.kind == "tank":
+            r = s.rect
+            chase = abs(p.x - s.x) < 520 and abs(p.y - s.y) < 140
+            if chase: s.dir = 1 if p.x > s.x else -1
+            ax = r.right + 2 if s.dir > 0 else r.left - 2
+            blocked = s.wall or (ax // T, (r.bottom + 2) // T) not in room["solid"]
+            if blocked and not chase: s.dir *= -1
+            s.vx = 0 if blocked else (62 if chase else 34) * s.dir
+            s.move(room, dt)
+        elif s.kind == "bat":
+            d = math.hypot(p.x - s.x, p.y - s.y) or 1
+            s.cd = max(0, s.cd - dt)
+            if s.state == "hang":
+                s.vx = s.vy = 0
+                if d < 280 and s.cd <= 0:
+                    s.state, s.t = "swoop", 0.9
+                    s.vx, s.vy = (p.x - s.x) / d * 400, (p.y + 10 - s.y) / d * 400
+            elif s.state == "swoop":
+                s.t -= dt
+                if s.t <= 0 or s.wall or s.ground: s.state = "back"
+            else:
+                hx, hy = s.home[0] - s.x, s.home[1] - s.y
+                hd = math.hypot(hx, hy) or 1
+                if hd < 10:
+                    s.state, s.cd, s.vx, s.vy = "hang", 1.2, 0, 0
+                    s.x, s.y = s.home
+                else:
+                    s.vx, s.vy = hx / hd * 200, hy / hd * 200
+            s.move(room, dt, False)
+        elif s.kind == "ghost":
+            dx, dy = p.x - s.x, p.y - s.y
+            d = math.hypot(dx, dy) or 1
+            sp = 70 if d < 520 else 0
+            s.vx += ((dx / d * sp) - s.vx) * min(1, 1.5 * dt)
+            s.vy += ((dy / d * sp + math.sin(s.age * 2) * 30) - s.vy) * min(1, 1.5 * dt)
+            s.x += s.vx * dt; s.y += s.vy * dt
+        elif s.kind == "weaver":
+            s.face = 1 if p.x > s.x else -1
+            cx, cy = s.x + s.w / 2, s.y + s.h / 2
+            s.t -= dt
+            if s.state == "idle":
+                tx, ty = p.x - s.w / 2 + 12, max(2 * T, p.y - 180)
+                s.vx = max(-260, min(260, (tx - s.x) * 1.6)); s.vy = max(-200, min(200, (ty - s.y) * 2))
+                if s.t <= 0:
+                    s.cycle += 1
+                    s.state, s.t = ("dive", 0.6) if s.cycle % 3 == 0 else ("fan", 0.5)
+            elif s.state == "fan":
+                s.vx = s.vy = 0
+                if s.t <= 0:
+                    base = math.atan2(p.y - cy, p.x - cx)
+                    for a in (-0.5, -0.25, 0, 0.25, 0.5):
+                        g.shots.append([cx, cy, math.cos(base + a) * 300, 4.0, math.sin(base + a) * 300, "orb"])
+                    s.state, s.t = "idle", 1.5
+            elif s.state == "dive":
+                s.vx = s.vy = 0
+                if s.t <= 0: s.state, s.vy = "slam", 820
+            else:
+                if s.ground:
+                    g.shake = 0.35
+                    for d in (-1, 1):
+                        g.shots.append([s.rect.centerx, s.rect.bottom - 22, d * 380, 1.6, 0, "wave"])
+                    s.state, s.t, s.vy = "idle", 1.4, 0
+            s.move(room, dt, False)
+        elif s.kind == "seraph":
+            s.seraph_ai(g, dt)
+        elif s.kind in ("boss", "warden"):
+            face = s.face = 1 if p.x > s.x else -1
+            sp = 1.35 if s.kind == "warden" else 1
+            if s.state == "idle":
+                s.vx = 0; s.t -= dt
+                if s.t <= 0:
+                    s.cycle += 1
+                    if s.cycle % 3 == 0: s.state, s.t, s.vx = "charge", 0.7, face * 520 * sp
+                    else: s.state, s.t, s.vy, s.vx = "air", 0.2, -950, face * 300 * sp
+            elif s.state == "charge":
+                s.t -= dt
+                if s.t <= 0 or s.wall: s.state, s.t, s.vx = "idle", 0.9, 0
+            elif s.state == "air":
+                s.t -= dt
+                if s.ground and s.t <= 0:
+                    s.state, s.t, s.vx = "idle", 1.0, 0
+                    g.shake = 0.3
+                    for d in (-1, 1):
+                        g.shots.append([s.rect.centerx, s.rect.bottom - 22, d * 380, 1.6, 0, "wave"])
+                    if s.kind == "warden":
+                        for vx in (-210, -80, 80, 210):
+                            g.shots.append([s.rect.centerx, s.rect.y, vx, 3.0, -640, "spit"])
+            s.move(room, dt)
+
+
+# ------------------------------------------------------------------ art
+def cl(v): return max(0, min(255, int(v)))
+def shade(c, d): return tuple(cl(v + d) for v in c[:3])
+
+GLOW = {}
+def glow(radius, color):
+    k = (radius, color)
+    if k not in GLOW:
+        sf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+        for r in range(radius, 0, -2):
+            pygame.draw.circle(sf, (*color, int(110 * (1 - r / radius) ** 2)), (radius, radius), r)
+        GLOW[k] = sf
+    return GLOW[k]
+
+
+def make_stone(rng):
+    base = (46 + rng.randint(-5, 5), 50 + rng.randint(-5, 5), 76 + rng.randint(-5, 5))
+    sf = pygame.Surface((T, T)); sf.fill(base)
+    for _ in range(12):
+        pygame.draw.circle(sf, shade(base, rng.randint(-14, 12)),
+                           (rng.randrange(T), rng.randrange(T)), rng.randint(2, 6))
+    for _ in range(70):
+        sf.set_at((rng.randrange(T), rng.randrange(T)), shade(base, rng.randint(-26, 26)))
+    if rng.random() < 0.6:
+        x, y = rng.randrange(6, 26), rng.randrange(2, 8)
+        for _ in range(5):
+            nx, ny = x + rng.randint(-6, 6), y + rng.randint(3, 7)
+            pygame.draw.line(sf, shade(base, -32), (x, y), (nx, ny), 1); x, y = nx, ny
+    for a, b in (((0, 0), (T - 1, 0)), ((0, 0), (0, T - 1))):
+        pygame.draw.line(sf, shade(base, 14), a, b)
+    for a, b in (((0, T - 1), (T - 1, T - 1)), ((T - 1, 0), (T - 1, T - 1))):
+        pygame.draw.line(sf, shade(base, -22), a, b)
+    return sf
+
+
+def make_top(stone, rng):
+    sf = pygame.Surface((T, T + 8), pygame.SRCALPHA)
+    sf.blit(stone, (0, 8))
+    for x in range(T):
+        c = (rng.randint(40, 70), rng.randint(95, 150), rng.randint(70, 100))
+        pygame.draw.line(sf, c, (x, 8 - rng.randint(0, 6)), (x, 8 + rng.randint(3, 7)))
+    for x in range(2, T, 5):
+        pygame.draw.line(sf, (48, 110, 80), (x, 12), (x + rng.randint(-1, 1), 12 + rng.randint(4, 9)))
+    return sf
+
+
+def make_layer(rng, color, lw, hmin, hmax):
+    sf = pygame.Surface((lw, H), pygame.SRCALPHA)
+    x = 0
+    while x < lw:
+        wd, h = rng.randint(30, 90), rng.randint(hmin, hmax)
+        pygame.draw.polygon(sf, color, [(x, 0), (x + wd, 0), (x + wd * 0.55 + rng.randint(-8, 8), h)])
+        wd, h = rng.randint(30, 90), rng.randint(hmin, hmax)
+        pygame.draw.polygon(sf, color, [(x, H), (x + wd, H), (x + wd * 0.45 + rng.randint(-8, 8), H - h)])
+        x += rng.randint(50, 110)
+    return sf
+
+
+def make_art():
+    rng = random.Random(7)
+    stones = [make_stone(rng) for _ in range(6)]
+    art = dict(stone=stones, top=[make_top(s, rng) for s in stones])
+    bg = pygame.Surface((W, H))
+    for y in range(H):
+        f = y / H
+        pygame.draw.line(bg, (int(8 + 14 * f), int(10 + 16 * f), int(20 + 26 * f)), (0, y), (W, y))
+    art["bg"] = bg
+    art["far"] = make_layer(rng, (20, 24, 44, 255), 1500, 40, 150)
+    art["near"] = make_layer(rng, (28, 33, 58, 255), 1500, 60, 190)
+    v = pygame.Surface((W, H), pygame.SRCALPHA)
+    for i in range(14):
+        pygame.draw.rect(v, (0, 0, 0, int(150 * (1 - i / 14) ** 2)),
+                         (i * 9, i * 6, W - i * 18, H - i * 12), 9)
+    art["vig"] = v
+    art["spores"] = [(rng.random() * W, rng.random() * H, rng.random() * 6.28, 0.3 + rng.random())
+                     for _ in range(40)]
+    return art
+
+
+def build_props(room, ri):
+    rng = random.Random(100 + ri)
+    out = []
+    for cx, cy in sorted(room["solid"]):
+        if cy > 0 and (cx, cy - 1) not in room["solid"] and rng.random() < 0.4:
+            out.append((rng.choice(("mush", "crys", "grass", "rock")),
+                        cx * T + rng.randint(4, 24), cy * T, rng.random()))
+    return out
+
+
+def draw_prop(scr, kind, x, y, v, t):
+    if kind == "grass":
+        for i in range(4):
+            pygame.draw.line(scr, (55 + i * 8, 130, 90), (x + i * 3, y),
+                             (x + i * 3 + math.sin(t * 2 + x * 0.1 + i) * 3, y - 10 - (i % 2) * 4), 2)
+    elif kind == "mush":
+        h = 8 + int(v * 6)
+        pygame.draw.rect(scr, (200, 190, 170), (x - 1, y - h, 3, h))
+        scr.blit(glow(18, (110, 200, 255)), (x - 18, y - h - 16))
+        pygame.draw.ellipse(scr, (90, 170, 230), (x - 6, y - h - 5, 13, 8))
+        pygame.draw.ellipse(scr, (170, 225, 255), (x - 3, y - h - 4, 5, 3))
+    elif kind == "crys":
+        scr.blit(glow(22, (150, 110, 230)), (x - 22, y - 30))
+        pygame.draw.polygon(scr, (150, 110, 230), [(x - 4, y), (x - 1, y - 16 - int(v * 8)), (x + 3, y)])
+        pygame.draw.polygon(scr, (205, 175, 255), [(x + 2, y), (x + 6, y - 10), (x + 9, y)])
+    else:
+        pygame.draw.ellipse(scr, (70, 74, 100), (x - 5, y - 6, 11, 7))
+        pygame.draw.ellipse(scr, (90, 95, 125), (x + 4, y - 4, 7, 5))
+
+
+def update_cape(p, dt, t):
+    N, seg = 5, 5.0
+    ax, ay = p.x + p.w / 2 - p.face * 3, p.y + 21
+    if p.cape is None or math.hypot(p.cape[1][0] - ax, p.cape[1][1] - ay) > 90:
+        p.cape = [[ax - p.face * i * 2, ay + i * seg * 0.9] for i in range(N)]
+    c = p.cape
+    c[0] = [ax, ay]
+    sp = abs(p.vx) / 300
+    k = min(1, 14 * dt)
+    for i in range(1, N):
+        px, py = c[i - 1]; x, y = c[i]
+        tx = px - p.vx * 0.045 * (1 + i * 0.1) - p.face * 2 + math.sin(t * 7 + i * 0.9) * (1 + sp * 3)
+        ty = py + seg * 0.9 - p.vy * 0.012 + math.sin(t * 5 + i) * 0.6
+        x += (tx - x) * k; y += (ty - y) * k
+        dx, dy = x - px, y - py
+        d = math.hypot(dx, dy) or 1
+        if d > seg: x, y = px + dx / d * seg, py + dy / d * seg
+        c[i] = [x, y]
+
+
+def draw_cape(scr, pts, ox, col=(105, 108, 118)):
+    L, R = [], []
+    n = len(pts)
+    for i, (x, y) in enumerate(pts):
+        nx, ny = pts[min(i + 1, n - 1)]; px, py = pts[max(i - 1, 0)]
+        dx, dy = nx - px, ny - py
+        d = math.hypot(dx, dy) or 1
+        w = 3 + i * 1.7
+        L.append((x + ox - dy / d * w, y + dx / d * w))
+        R.append((x + ox + dy / d * w, y - dx / d * w))
+    poly = L + R[::-1]
+    pygame.draw.polygon(scr, col, poly)
+    pygame.draw.lines(scr, shade(col, 45), False, [(x + ox, y) for x, y in pts[1:]], 2)
+    pygame.draw.polygon(scr, shade(col, -40), poly, 2)
+
+
+def ik(hip, foot, l1, l2, bend):
+    dx, dy = foot[0] - hip[0], foot[1] - hip[1]
+    dist = math.hypot(dx, dy) or 1
+    d = min(dist, l1 + l2 - 0.5)
+    a = (l1 * l1 - l2 * l2 + d * d) / (2 * d)
+    h = math.sqrt(max(0, l1 * l1 - a * a))
+    ux, uy = dx / dist, dy / dist
+    return (hip[0] + ux * a - uy * h * bend, hip[1] + uy * a + ux * h * bend)
+
+
+def draw_player(scr, p, ox, t):
+    """Draw the knight as one connected body with three horns and a short gray cape."""
+    R = p.rect.move(ox, 0)
+    f = p.face
+
+    # Wings remain behind the body when unlocked.
+    if p.has_wings and not p.ground:
+        fw = math.sin(t * 20) * 6
+        for s_ in (-1, 1):
+            pygame.draw.polygon(scr, (255, 245, 190), [
+                (R.centerx + s_ * 3, R.y + 24),
+                (R.centerx + s_ * 24, R.y + 10 + fw),
+                (R.centerx + s_ * 18, R.y + 30)])
+
+    if p.cape:
+        draw_cape(scr, p.cape, ox, (105, 108, 118))
+
+    sf = pygame.Surface((110, 120), pygame.SRCALPHA)
+    r = pygame.Rect(43, 44, p.w, p.h)
+    cx = r.centerx
+    moving = p.ground and abs(p.vx) > 20 and p.knock <= 0
+    spd = min(1.0, abs(p.vx) / 290)
+    bob = -abs(math.sin(p.walk_t)) * 2.2 * spd if moving else math.sin(t * 2.2) * 0.5
+    lean = max(-1, min(1, p.vx / 290)) * 2.5 if p.knock <= 0 else 0
+
+    # A single connected dark cloak/body instead of separate animated limbs.
+    body_top = r.y + 20 + bob
+    body_bottom = r.bottom - 2
+    body_left = cx - 10 + lean
+    body_right = cx + 10 + lean
+    pygame.draw.ellipse(sf, (16, 17, 28),
+                        (body_left - 4, body_top + 2, 28, 18))
+    pygame.draw.polygon(sf, (22, 23, 36), [
+        (body_left + 1, body_top + 10),
+        (body_right - 1, body_top + 10),
+        (body_right + 5, body_bottom - 7),
+        (cx + 5, body_bottom + 1),
+        (cx - 6, body_bottom + 1),
+        (body_left - 5, body_bottom - 7),
+    ])
+    pygame.draw.polygon(sf, (48, 49, 65), [
+        (cx - 7, body_top + 11), (cx + 1, body_top + 11),
+        (cx + 5, body_bottom - 6), (cx, body_bottom - 1),
+        (cx - 5, body_bottom - 6)
+    ])
+
+    # Short gray shoulder cape/collar.
+    pygame.draw.polygon(sf, (105, 108, 118), [
+        (cx - 12, body_top + 5), (cx - 5, body_top + 12),
+        (cx, body_top + 8), (cx + 5, body_top + 12),
+        (cx + 12, body_top + 5), (cx + 8, body_top - 1),
+        (cx, body_top + 3), (cx - 8, body_top - 1)
+    ])
+
+    # Head.
+    hx = cx + lean
+    hy = r.y + bob - 3
+    pygame.draw.ellipse(sf, (226, 226, 238), (hx - 12, hy + 2, 24, 22))
+    pygame.draw.ellipse(sf, (248, 248, 254), (hx - 9 + f * 2, hy + 4, 14, 8))
+    pygame.draw.ellipse(sf, (190, 190, 210), (hx - 12, hy + 2, 24, 22), 2)
+
+    # Three horns: two outer horns plus a central crown-like horn.
+    horn_col = (238, 238, 246)
+    horn_shadow = (205, 205, 220)
+    pygame.draw.polygon(sf, horn_col, [
+        (hx - 8, hy + 8), (hx - 12, hy - 1), (hx - 10, hy - 10),
+        (hx - 5, hy - 1), (hx - 3, hy + 8)
+    ])
+    pygame.draw.polygon(sf, horn_col, [
+        (hx - 2, hy + 5), (hx, hy - 13), (hx + 3, hy + 5)
+    ])
+    pygame.draw.polygon(sf, horn_col, [
+        (hx + 3, hy + 8), (hx + 9, hy - 1), (hx + 11, hy - 10),
+        (hx + 12, hy - 1), (hx + 8, hy + 9)
+    ])
+    pygame.draw.line(sf, horn_shadow, (hx, hy - 11), (hx + 1, hy + 3), 1)
+
+    # Eyes.
+    for s_ in (-1, 1):
+        pygame.draw.ellipse(sf, (12, 12, 20),
+                            (hx + s_ * 5 + f * 2 - 3, hy + 11, 6, 8))
+
+    # Nail arm is attached to the body rather than being a separate limb.
+    hand = (cx + f * 7 + lean, body_top + 12)
+    if p.slash:
+        v = {"up": (0, -1), "down": (0, 1), "l": (-1, 0), "r": (1, 0)}[p.slash["dir"]]
+    else:
+        v = (-f * 0.4, 0.9)
+    tip = (hand[0] + v[0] * 24, hand[1] + v[1] * 24)
+    pygame.draw.line(sf, (48, 49, 65), (cx + f * 3, body_top + 8), hand, 5)
+    pygame.draw.line(sf, (222, 226, 238), hand, tip, 3)
+    pygame.draw.line(sf, (120, 110, 100),
+                     (hand[0] - v[0] * 3, hand[1] - v[1] * 3), hand, 4)
+
+    # Squash/stretch keeps the whole body feeling alive without separating it into limbs.
+    sx = sy = 1.0
+    if p.land_t > 0:
+        k = p.land_t / 0.18 * p.land_amt
+        sy, sx = 1 - 0.20 * k, 1 + 0.16 * k
+    elif not p.ground:
+        k = min(1.0, abs(p.vy) / 700)
+        sy, sx = 1 + 0.12 * k, 1 - 0.07 * k
+    if p.jump_t > 0:
+        sy += 0.10 * p.jump_t / 0.2; sx -= 0.06 * p.jump_t / 0.2
+    if abs(sx - 1) > 0.01 or abs(sy - 1) > 0.01:
+        sf = pygame.transform.smoothscale(sf, (int(110 * sx), int(120 * sy)))
+    scr.blit(sf, (R.centerx - int(cx * sx), R.bottom - int(r.bottom * sy)))
+
+
+def draw_crawl(scr, e, ox):
+    r, d = e.rect.move(ox, 0), e.dir
+    shell = (255, 255, 255) if e.flash > 0 else (132, 92, 70)
+    tt = e.age * 9
+    for i in range(3):
+        for j in (0, 1):
+            x = r.x + 7 + i * 9 + j * 3
+            sw = math.sin(tt + i * 2.1 + j * math.pi) * 3
+            pygame.draw.line(scr, (60, 40, 34), (x, r.bottom - 7), (x + sw - d * 2, r.bottom + 1), 2)
+    body = pygame.Rect(r.x, r.y + 2, r.w, r.h - 6)
+    pygame.draw.ellipse(scr, shade(shell, -34), body.move(0, 2))
+    pygame.draw.ellipse(scr, shell, body)
+    for i in range(1, 4):
+        pygame.draw.arc(scr, shade(shell, -50), (body.x + i * body.w // 4 - 6, body.y, 12, body.h), 1.6, 4.7, 2)
+    pygame.draw.ellipse(scr, shade(shell, 40), (body.x + 6, body.y + 2, body.w - 14, 5))
+    hx = r.right - 3 if d > 0 else r.x + 3
+    pygame.draw.circle(scr, shade(shell, -22), (hx, r.centery + 1), 7)
+    pygame.draw.circle(scr, (255, 230, 120), (hx + d * 2, r.centery - 1), 3)
+    pygame.draw.circle(scr, (20, 12, 8), (hx + d * 3, r.centery - 1), 1)
+    for s_ in (-3, 2):
+        pygame.draw.line(scr, (60, 40, 34), (hx + d * 3, r.centery - 5),
+                         (hx + d * 10, r.centery - 11 + s_ + math.sin(tt) * 2), 2)
+
+
+def draw_fly(scr, e, ox):
+    r = e.rect.move(ox, 0)
+    face = 1 if e.vx >= 0 else -1
+    cx, cy = r.center
+    fl = e.flash > 0
+    body = (255, 255, 255) if fl else (96, 122, 88)
+    flap = math.sin(e.age * 32)
+    ws = pygame.Surface((64, 44), pygame.SRCALPHA)
+    for s_ in (-1, 1):
+        tip = (32 + s_ * 26, 14 - flap * 10)
+        tip2 = (32 + s_ * 20, 24 - flap * 6)
+        pygame.draw.polygon(ws, (205, 230, 220, 105), [(32 + s_ * 3, 24), tip, tip2])
+        pygame.draw.line(ws, (150, 190, 170, 170), (32 + s_ * 3, 24), tip, 1)
+    scr.blit(ws, (cx - 32, cy - 22))
+    ab = pygame.Rect(0, 0, 16, 12); ab.center = (cx - face * 10, cy + 3)
+    pygame.draw.ellipse(scr, shade(body, -18), ab)
+    for i in range(3):
+        pygame.draw.line(scr, (30, 40, 28), (ab.x + 4 + i * 4, ab.y + 1), (ab.x + 4 + i * 4, ab.bottom - 2), 1)
+    pygame.draw.polygon(scr, (70, 45, 45), [(ab.centerx - face * 8, cy + 3),
+                        (ab.centerx - face * 15, cy + 8), (ab.centerx - face * 8, cy + 6)])
+    for i in (-1, 0, 1):
+        pygame.draw.line(scr, (50, 60, 44), (cx + i * 4, cy + 6),
+                         (cx + i * 4 + face * 2, cy + 13 + math.sin(e.age * 9 + i)), 1)
+    pygame.draw.ellipse(scr, body, (cx - 8, cy - 8, 16, 15))
+    pygame.draw.circle(scr, shade(body, -12), (cx + face * 8, cy - 2), 6)
+    pygame.draw.circle(scr, (210, 50, 50), (cx + face * 10, cy - 3), 3)
+    pygame.draw.circle(scr, (255, 190, 190), (cx + face * 11, cy - 4), 1)
+
+
+def draw_boss(scr, e, ox, t):
+    r = e.rect.move(ox, 0)
+    f, cx = e.face, r.centerx
+    armor = (255, 255, 255) if e.flash > 0 else ((128, 62, 52) if e.kind == "warden" else (78, 70, 94))
+    dark, light = shade(armor, -30), shade(armor, 24)
+    air, charge = e.state == "air", e.state == "charge"
+    lean = f * (12 if charge else 0)
+    stride = math.sin(e.age * 14) * 7 if charge else 0
+    for s_ in (-1, 1):
+        lx = cx + s_ * 17 + stride * s_ * 0.5
+        pygame.draw.rect(scr, dark, (lx - 9, r.bottom - 30, 18, 30), border_radius=6)
+        pygame.draw.ellipse(scr, armor, (lx - 12 + f * 3, r.bottom - 9, 26, 10))
+        pygame.draw.rect(scr, light, (lx - 6, r.bottom - 30, 4, 22), border_radius=2)
+    br = math.sin(t * 2.2) * 2
+    tor = pygame.Rect(int(cx - 31 + lean // 2), int(r.y + 24 - br), 62, 52)
+    pygame.draw.ellipse(scr, dark, tor.move(0, 3))
+    pygame.draw.ellipse(scr, armor, tor)
+    for i in range(3):
+        pygame.draw.arc(scr, dark, (tor.x + 6, tor.y + 8 + i * 12, tor.w - 12, 16), 3.5, 5.9, 3)
+    pygame.draw.ellipse(scr, light, (tor.x + 10, tor.y + 4, 22, 8))
+    for k in range(3):
+        pygame.draw.line(scr, (30, 28, 40), (tor.centerx + k * 9 - 9, tor.y + 14),
+                         (tor.centerx + k * 9 - 6, tor.y + 30 + k * 4), 2)
+    for s_ in (-1, 1):
+        sx = cx + s_ * 33 + lean
+        if air: hand = (sx + s_ * 8, r.y + 6)
+        elif charge: hand = (sx + f * 30, r.y + 48)
+        else: hand = (sx + s_ * 6, r.y + 62 + math.sin(t * 2 + s_) * 3)
+        pygame.draw.line(scr, dark, (sx, r.y + 34), hand, 12)
+        pygame.draw.circle(scr, armor, hand, 10)
+        pygame.draw.circle(scr, light, (hand[0] - 2, hand[1] - 2), 3)
+        pygame.draw.circle(scr, armor, (sx, r.y + 32), 13)
+        pygame.draw.polygon(scr, light, [(sx - 5, r.y + 24), (sx + 5, r.y + 24), (sx, r.y + 8)])
+    hx, hy = cx + lean + f * 3, r.y + 16
+    for s_ in (-1, 1):
+        pygame.draw.polygon(scr, shade(armor, 6), [(hx + s_ * 10, hy - 8), (hx + s_ * 24, hy - 30), (hx + s_ * 20, hy - 4)])
+    pygame.draw.ellipse(scr, armor, (hx - 18, hy - 14, 36, 32))
+    pygame.draw.ellipse(scr, light, (hx - 12, hy - 11, 16, 8))
+    pulse = 0.6 + 0.4 * math.sin(t * 5)
+    for s_ in (-1, 1):
+        ex, ey = hx + s_ * 7 + f * 3, hy + 2
+        scr.blit(glow(16, (255, 140, 40)), (ex - 16, ey - 16))
+        pygame.draw.ellipse(scr, (255, int(170 * pulse + 60), 60), (ex - 4, ey - 3, 8, 6))
+    pygame.draw.line(scr, dark, (hx - 8, hy + 12), (hx + 8, hy + 12), 3)
+
+
+LOOKS = {"elder": ((110, 110, 140), (205, 205, 220)), "merchant": ((60, 110, 80), (215, 200, 160)),
+         "hunter": ((110, 78, 58), (190, 170, 140)), "child": ((165, 90, 120), (238, 218, 226)),
+         "hermit": ((90, 66, 140), (205, 195, 232))}
+
+
+def npc_rect(n): return pygame.Rect(n["x"] * T - 24, (n["y"] + 1) * T - 56, 80, 56)
+def door_rect(d): return pygame.Rect(d["x"] * T - 6, (d["y"] - 1) * T, T + 12, 2 * T)
+
+
+def wrap(font, text, width):
+    lines, cur = [], ""
+    for w_ in text.split():
+        test = (cur + " " + w_).strip()
+        if font.size(test)[0] > width and cur: lines.append(cur); cur = w_
+        else: cur = test
+    return lines + [cur]
+
+
+def draw_npc(scr, n, ox, t, px):
+    cloak, face = LOOKS[n["look"]]
+    look = n["look"]
+    k = 0.75 if look == "child" else 1.0
+    cx = n["x"] * T + ox + 16
+    fy = (n["y"] + 1) * T
+    f = 1 if px > n["x"] * T + 16 else -1
+    bob = math.sin(t * 2 + n["x"]) * 1.5
+    top = fy - 30 * k + bob
+    if look == "elder":
+        pygame.draw.line(scr, (140, 110, 80), (cx + f * 14, fy), (cx + f * 14, fy - 54), 3)
+        scr.blit(glow(16, (160, 220, 255)), (cx + f * 14 - 16, fy - 72))
+        pygame.draw.circle(scr, (190, 235, 255), (int(cx + f * 14), int(fy - 56)), 4)
+    elif look == "hunter":
+        pygame.draw.line(scr, (150, 130, 100), (cx - f * 14, fy), (cx - f * 12, fy - 62), 3)
+        pygame.draw.polygon(scr, (200, 205, 215), [(cx - f * 15, fy - 62), (cx - f * 9, fy - 62), (cx - f * 12, fy - 74)])
+    elif look == "merchant":
+        pygame.draw.ellipse(scr, (120, 90, 60), (cx - f * 20 - 10, fy - 44, 22, 28))
+        scr.blit(glow(26, (255, 200, 120)), (cx + f * 16 - 26, fy - 22 - 26))
+        pygame.draw.circle(scr, (255, 226, 160), (int(cx + f * 16), int(fy - 22)), 4)
+    robe = [(cx - 12 * k, fy), (cx + 12 * k, fy), (cx + 7 * k, top), (cx - 7 * k, top)]
+    pygame.draw.polygon(scr, cloak, robe)
+    pygame.draw.polygon(scr, shade(cloak, -30), robe, 2)
+    pygame.draw.line(scr, shade(cloak, 25), (cx, fy - 4), (cx, top + 4), 2)
+    hy = top - 8 * k
+    pygame.draw.circle(scr, face, (int(cx), int(hy)), int(10 * k))
+    pygame.draw.polygon(scr, cloak, [(cx - 11 * k, hy - 1), (cx + 11 * k, hy - 1), (cx, hy - 17 * k)])
+    for s_ in (-3, 3):
+        pygame.draw.circle(scr, (20, 20, 30), (int(cx + f * 3 + s_), int(hy + 2)), 2)
+    if look == "hermit":
+        scr.blit(glow(24, (170, 130, 255)), (cx - 24, hy - 46))
+        pygame.draw.polygon(scr, (180, 150, 255), [(cx - 4, hy - 14), (cx, hy - 32), (cx + 4, hy - 14)])
+
+
+def draw_door(scr, d, ox, t):
+    x, y = d["x"] * T + ox, (d["y"] - 1) * T
+    scr.blit(glow(46, (150, 200, 255)), (x + 16 - 46, y + 32 - 46))
+    pygame.draw.rect(scr, (10, 12, 22), (x + 2, y + 2, T - 4, 2 * T - 2), border_top_left_radius=16, border_top_right_radius=16)
+    pygame.draw.rect(scr, (110, 120, 165), (x, y, T, 2 * T), 3, border_top_left_radius=16, border_top_right_radius=16)
+    pygame.draw.circle(scr, (190, 225, 255), (x + 16, y + 34 + int(math.sin(t * 3) * 2)), 3)
+
+
+def draw_spitter(scr, e, ox, t):
+    r, f = e.rect.move(ox, 0), e.face
+    bulb = (255, 255, 255) if e.flash > 0 else (128, 74, 150)
+    bx, by = r.centerx + f * 3 + math.sin(e.age * 2) * 3, r.y + 12
+    for s_ in (-1, 1):
+        pygame.draw.polygon(scr, (52, 110, 74), [(r.centerx, r.bottom), (r.centerx + s_ * 18, r.bottom - 14), (r.centerx + s_ * 4, r.bottom - 4)])
+    pygame.draw.line(scr, (60, 125, 82), (r.centerx, r.bottom), (bx, by), 7)
+    pygame.draw.ellipse(scr, bulb, (bx - 15, by - 13, 30, 26))
+    pygame.draw.ellipse(scr, shade(bulb, 35), (bx - 10, by - 10, 12, 7))
+    for dx, dy in ((-7, 4), (5, 6), (8, -3)):
+        pygame.draw.circle(scr, shade(bulb, -25), (int(bx + dx), int(by + dy)), 3)
+    mx, charge = bx + f * 12, e.t < 0.5
+    if charge: scr.blit(glow(22, (170, 240, 130)), (mx - 22, by - 22))
+    pygame.draw.ellipse(scr, (30, 14, 34), (mx - 6, by - 6, 12, 12))
+    if charge: pygame.draw.circle(scr, (190, 255, 150), (int(mx), int(by)), 4)
+
+
+def draw_hopper(scr, e, ox):
+    r, f = e.rect.move(ox, 0), e.face
+    col = (255, 255, 255) if e.flash > 0 else (70, 132, 112)
+    air = not e.ground
+    h = r.h + (8 if air else -3)
+    body = pygame.Rect(r.x, r.bottom - h, r.w, h)
+    lx = r.centerx - f * 12
+    if air:
+        pygame.draw.polygon(scr, shade(col, -30), [(lx, r.bottom - 12), (lx - f * 10, r.bottom + 4), (lx - f * 16, r.bottom + 2), (lx + f * 4, r.bottom - 20)])
+    else:
+        pygame.draw.ellipse(scr, shade(col, -30), (lx - 12, r.bottom - 12, 24, 12))
+    pygame.draw.ellipse(scr, col, body)
+    pygame.draw.ellipse(scr, shade(col, 45), (body.x + 5, body.bottom - 10, body.w - 10, 8))
+    for k in (0, 1):
+        ex = r.centerx + f * (5 + k * 8)
+        pygame.draw.circle(scr, shade(col, 15), (ex, body.y + 4), 6)
+        pygame.draw.circle(scr, (250, 220, 90), (ex, body.y + 4), 4)
+        pygame.draw.circle(scr, (10, 10, 10), (ex + f, body.y + 4), 2)
+    pygame.draw.line(scr, shade(col, -60), (r.centerx + f * 2, body.centery + 3), (r.centerx + f * 15, body.centery + 3), 2)
+
+
+def draw_tank(scr, e, ox):
+    r, d = e.rect.move(ox, 0), e.dir
+    shell = (255, 255, 255) if e.flash > 0 else (86, 84, 112)
+    for i in range(4):
+        x = r.x + 8 + i * 10
+        pygame.draw.line(scr, (44, 42, 60), (x, r.bottom - 8), (x + math.sin(e.age * 7 + i * 1.7) * 4, r.bottom + 1), 3)
+    body = pygame.Rect(r.x, r.y, r.w, r.h - 6)
+    pygame.draw.ellipse(scr, shade(shell, -34), body.move(0, 3))
+    pygame.draw.ellipse(scr, shell, body)
+    for i in range(1, 5):
+        pygame.draw.arc(scr, shade(shell, -48), (body.x + i * body.w // 5 - 7, body.y, 14, body.h), 1.6, 4.7, 2)
+    for i in range(4):
+        bx = body.x + 8 + i * 10
+        pygame.draw.polygon(scr, shade(shell, 30), [(bx - 4, body.y + 5), (bx + 4, body.y + 5), (bx, body.y - 6)])
+    hx = r.right - 2 if d > 0 else r.x + 2
+    pygame.draw.ellipse(scr, shade(shell, -12), (hx - 10 + d * 2, r.centery - 6, 20, 16))
+    pygame.draw.polygon(scr, (210, 205, 190), [(hx + d * 8, r.centery - 4), (hx + d * 8, r.centery - 10), (hx + d * 20, r.centery - 12)])
+    pygame.draw.circle(scr, (255, 90, 70), (hx + d * 4, r.centery), 3)
+
+
+def draw_bat(scr, e, ox):
+    r = e.rect.move(ox, 0); cx, cy = r.center
+    hang = e.state == "hang"
+    col = (255, 255, 255) if e.flash > 0 else (70, 56, 96)
+    flap = 0.2 if hang else math.sin(e.age * 24)
+    for s_ in (-1, 1):
+        if hang:
+            pygame.draw.ellipse(scr, col, (cx + s_ * 6 - 4, cy - 12, 9, 22))
+        else:
+            tip = (cx + s_ * 28, cy - 10 - flap * 12)
+            pygame.draw.polygon(scr, col, [(cx + s_ * 4, cy - 4), tip, (cx + s_ * 20, cy + 8 - flap * 6), (cx + s_ * 8, cy + 6)])
+            pygame.draw.line(scr, shade(col, 40), (cx + s_ * 4, cy - 4), tip, 1)
+    pygame.draw.ellipse(scr, shade(col, 10), (cx - 7, cy - 9, 14, 18))
+    hy = cy + 8 if hang else cy - 8
+    ed = 1 if hang else -1
+    pygame.draw.circle(scr, shade(col, 15), (cx, hy), 6)
+    for s_ in (-1, 1):
+        pygame.draw.polygon(scr, shade(col, 15), [(cx + s_ * 2, hy), (cx + s_ * 7, hy), (cx + s_ * 6, hy + ed * 9)])
+        pygame.draw.circle(scr, (255, 70, 70), (cx + s_ * 3, hy), 2)
+
+
+def draw_ghost(scr, e, ox, t):
+    r = e.rect.move(ox, 0); cx, cy = r.center
+    f = 1 if e.vx >= 0 else -1
+    c = (255, 255, 255) if e.flash > 0 else (190, 202, 245)
+    scr.blit(glow(40, (150, 170, 255)), (cx - 40, cy - 40))
+    ss = pygame.Surface((60, 70), pygame.SRCALPHA)
+    pygame.draw.ellipse(ss, (*c, 150), (18, 6, 24, 30))
+    pts = [(18, 22)] + [(18 + i * 6, 46 + math.sin(t * 5 + i * 1.3) * 4 + (6 if i % 2 else 0)) for i in range(5)] + [(42, 22)]
+    pygame.draw.polygon(ss, (*c, 150), pts)
+    pygame.draw.ellipse(ss, (10, 10, 30, 230), (22 + f * 2, 16, 6, 9))
+    pygame.draw.ellipse(ss, (10, 10, 30, 230), (32 + f * 2, 16, 6, 9))
+    scr.blit(ss, (cx - 30, cy - 35))
+
+
+def draw_weaver(scr, e, ox, t):
+    r = e.rect.move(ox, 0); cx, cy = r.center
+    fl = e.flash > 0
+    crys = (255, 255, 255) if fl else (170, 140, 255)
+    scr.blit(glow(70, (150, 110, 255)), (cx - 70, cy - 70))
+    flap = math.sin(e.age * 8)
+    for s_ in (-1, 1):
+        for j, (ln, ang) in enumerate(((46, -0.55), (54, 0.0), (42, 0.55))):
+            a = ang + flap * 0.22
+            tip = (cx + s_ * math.cos(a) * ln, cy - 6 + math.sin(a) * ln)
+            pygame.draw.polygon(scr, crys, [(cx + s_ * 8, cy - 6 + j * 4), tip, (cx + s_ * 8, cy + 2 + j * 4)])
+            pygame.draw.line(scr, shade(crys, 60), (cx + s_ * 8, cy - 2 + j * 4), tip, 1)
+    for i in range(-2, 3):
+        pygame.draw.line(scr, (60, 40, 90), (cx + i * 6, cy + 14), (cx + i * 9 + math.sin(e.age * 5 + i) * 3, cy + 34), 2)
+    pygame.draw.ellipse(scr, (44, 30, 72), (cx - 16, cy - 20, 32, 40))
+    pygame.draw.ellipse(scr, (70, 50, 110), (cx - 12, cy - 17, 14, 10))
+    pulse = 0.6 + 0.4 * math.sin(t * 4)
+    pygame.draw.circle(scr, (255, 255, 255) if fl else (120, 255, 240), (cx, cy + 2), int(6 + pulse * 2))
+    for s_ in (-1, 1):
+        pygame.draw.circle(scr, (255, 90, 190), (cx + s_ * 6, cy - 10), 2)
+
+
+def draw_seraph_bg(scr, e, cam, t):
+    sx = W // 2 + int((e.ax - (cam + W / 2)) * 0.1)
+    sy = 150
+    ph = e.phase
+    col = {1: (255, 226, 140), 2: (255, 240, 200), 3: (255, 150, 110)}[ph]
+    scr.blit(glow(300, col), (sx - 300, sy - 300))
+    layer = pygame.Surface((W, H), pygame.SRCALPHA)
+    flap = math.sin(t * 0.9) * 0.05
+    for s_ in (-1, 1):
+        for j in range(3):
+            bx, by = sx + s_ * 110, sy + 170 + j * 34
+            for i in range(9):
+                a = -0.9 + j * 0.55 + i * 0.075 + flap
+                ln = 760 - i * 28 - j * 60
+                dx, dy = math.cos(a) * s_, math.sin(a)
+                px, py = -dy * s_, dx * s_
+                mid = (bx + dx * ln * 0.6, by + dy * ln * 0.6)
+                tip = (bx + dx * ln, by + dy * ln)
+                pts = [(bx + px * 6, by + py * 6), (mid[0] + px * 24, mid[1] + py * 24), tip,
+                       (mid[0] - px * 24, mid[1] - py * 24), (bx - px * 6, by - py * 6)]
+                pygame.draw.polygon(layer, (255, 250, 235, 105), pts)
+                pygame.draw.polygon(layer, (*col, 150), pts, 1)
+    hc = (sx, sy - 250)
+    for rad, wd, spd in ((420, 6, 0.25), (340, 4, -0.35), (260, 3, 0.5)):
+        pygame.draw.circle(layer, (*col, 170), hc, rad, wd)
+        for n in range(36):
+            ang = t * spd + n * math.tau / 36
+            c0, s0 = math.cos(ang), math.sin(ang)
+            pygame.draw.line(layer, (*col, 200), (hc[0] + c0 * (rad - 14), hc[1] + s0 * (rad - 14)),
+                             (hc[0] + c0 * (rad + 14), hc[1] + s0 * (rad + 14)), 2)
+    pygame.draw.polygon(layer, (236, 232, 250, 150), [(sx - 200, sy + 170), (sx + 200, sy + 170), (sx + 430, H + 40), (sx - 430, H + 40)])
+    for k in range(-4, 5):
+        pygame.draw.line(layer, (200, 196, 225, 160), (sx + k * 40, sy + 200), (sx + k * 95, H + 40), 2)
+    pygame.draw.ellipse(layer, (236, 232, 250, 255), (sx - 240, sy - 290, 480, 580))
+    pygame.draw.ellipse(layer, (250, 248, 255, 255), (sx - 170, sy - 240, 260, 200))
+    pygame.draw.ellipse(layer, (196, 190, 224, 255), (sx - 240, sy - 290, 480, 580), 6)
+    pygame.draw.polygon(layer, (*col, 255), [(sx, sy - 200), (sx + 26, sy - 160), (sx, sy - 120), (sx - 26, sy - 160)], 3)
+    if ph >= 3:
+        for dx0, dy0, dx1, dy1 in ((-150, -40, -60, 120), (170, -90, 80, 60), (0, -230, -30, -100)):
+            pygame.draw.line(layer, (255, 120, 90, 230), (sx + dx0, sy + dy0), (sx + dx1, sy + dy1), 3)
+    scr.blit(layer, (0, 0))
+    open_eyes = e.state != "intro" or e.t < 1.2
+    for s_ in (-1, 1):
+        ex, ey = sx + s_ * 95, sy - 10
+        if open_eyes:
+            scr.blit(glow(90, col), (ex - 90, ey - 90))
+            pygame.draw.ellipse(scr, (255, 252, 230), (ex - 46, ey - 20, 92, 40))
+            pygame.draw.ellipse(scr, col, (ex - 22, ey - 18, 44, 36))
+            pygame.draw.circle(scr, (255, 255, 255), (ex, ey), 9)
+        else:
+            pygame.draw.arc(scr, (150, 140, 180), (ex - 46, ey - 16, 92, 40), 3.4, 6.0, 4)
+        pygame.draw.line(scr, (*col, ), (ex, ey + 22), (ex + s_ * 14, ey + 150), 3)
+    if e.state == "phase":
+        fo = pygame.Surface((W, H)); fo.fill(col); fo.set_alpha(int(60 + 40 * math.sin(t * 12))); scr.blit(fo, (0, 0))
+
+
+def draw_hand(scr, x, y, state, flash, t):
+    skin = (255, 255, 255) if flash else (238, 234, 252)
+    scr.blit(glow(100, (255, 230, 140)), (x - 100, y + 10))
+    pygame.draw.rect(scr, shade(skin, -34), (x - 70, y + 6, 140, 110), border_radius=30)
+    pygame.draw.rect(scr, skin, (x - 75, y, 150, 110), border_radius=32)
+    for i in range(5):
+        fx = x - 68 + i * 34
+        fl = 72 if i in (1, 2, 3) else 60
+        pygame.draw.rect(scr, skin, (fx, y + 90, 26, fl), border_radius=13)
+        pygame.draw.rect(scr, shade(skin, -28), (fx, y + 90, 26, fl), 2, border_radius=13)
+    if state == "rest":
+        pul = 0.6 + 0.4 * math.sin(t * 8)
+        scr.blit(glow(56, (255, 210, 110)), (x - 56, y - 6))
+        pygame.draw.circle(scr, (255, 215, 110), (x, y + 50), int(22 + 4 * pul), 3)
+        pygame.draw.line(scr, (255, 215, 110), (x - 16, y + 50), (x + 16, y + 50), 3)
+        pygame.draw.line(scr, (255, 215, 110), (x, y + 34), (x, y + 66), 3)
+    elif state == "fall":
+        pygame.draw.line(scr, (255, 245, 200), (x - 40, y - 120), (x - 40, y), 3)
+        pygame.draw.line(scr, (255, 245, 200), (x + 40, y - 120), (x + 40, y), 3)
+
+
+def draw_seraph_fg(scr, e, ox, t):
+    floor = 15 * T
+    strike = False
+    for b in e.bolts:
+        x = int(b["x"]) + ox
+        if b["state"] == "warn":
+            k = b["t"] / b["warn"]
+            col = (255, 240, 160) if int(b["t"] * (8 + 14 * k)) % 2 == 0 else (255, 160, 90)
+            pygame.draw.line(scr, col, (x, 0), (x, floor), 2 + int(k * 6))
+            pygame.draw.ellipse(scr, col, (x - 30, floor - 8, 60, 12), 2)
+            scr.blit(glow(26, (255, 230, 130)), (x - 26, floor - 26))
+        else:
+            strike = True
+            rg = random.Random(int(b["x"]) + int(b["t"] * 60))
+            pts, yy = [(x, 0)], 0
+            while yy < floor:
+                yy += rg.randint(40, 70)
+                pts.append((x + rg.randint(-24, 24), min(yy, floor)))
+            pygame.draw.lines(scr, (255, 255, 210), False, pts, 16)
+            pygame.draw.lines(scr, (255, 255, 255), False, pts, 6)
+            scr.blit(glow(60, (255, 240, 160)), (x - 60, floor - 60))
+    for h in e.hands:
+        x = int(h["x"]) + ox
+        if h["state"] == "warn":
+            k = min(1.0, h["t"])
+            sh = pygame.Surface((240, 40), pygame.SRCALPHA)
+            wd = int(80 + 140 * k)
+            pygame.draw.ellipse(sh, (0, 0, 0, int(50 + 110 * k)), (120 - wd // 2, 6, wd, 28))
+            scr.blit(sh, (x - 120, floor - 22))
+            pygame.draw.line(scr, (255, 240, 180), (x - 75, 0), (x + 75, 0), 4)
+        else:
+            draw_hand(scr, x, int(h["y"]), h["state"], e.flash > 0, t)
+    if strike:
+        fo = pygame.Surface((W, H)); fo.fill((255, 255, 230)); fo.set_alpha(60); scr.blit(fo, (0, 0))
+
+
+DRAWERS = {"crawl": lambda a, e, o, t: draw_crawl(a, e, o), "fly": lambda a, e, o, t: draw_fly(a, e, o),
+           "spitter": draw_spitter, "hopper": lambda a, e, o, t: draw_hopper(a, e, o),
+           "tank": lambda a, e, o, t: draw_tank(a, e, o), "bat": lambda a, e, o, t: draw_bat(a, e, o),
+           "ghost": draw_ghost, "weaver": draw_weaver, "boss": draw_boss, "warden": draw_boss, "seraph": draw_seraph_fg}
+
+
+# ------------------------------------------------------------------ game
+class Game:
+    def __init__(s):
+        pygame.init()
+        try: s.scr = pygame.display.set_mode((W, H), pygame.SCALED)
+        except Exception: s.scr = pygame.display.set_mode((W, H))
+        pygame.display.set_caption("Wonderous Soul")
+        try:
+            pygame.mixer.init()
+            s.music_ready = True
+            s.sfx = make_game_sfx()
+            s.sfx_channels = [pygame.mixer.Channel(i) for i in range(4)]
+        except pygame.error:
+            s.music_ready = False
+            s.sfx = {}
+            s.sfx_channels = []
+        s.clock = pygame.time.Clock()
+        s.font = pygame.font.SysFont("georgia", 20)
+        s.big = pygame.font.SysFont("georgia", 54)
+        s.mid = pygame.font.SysFont("georgia", 32)
+        s.state = "title"
+        s.art, s.props = make_art(), {}
+        load_settings()
+        s.mscreen, s.msel, s.mscroll, s.mreturn, s.confirm = "main", 0, 0.0, "main", None
+        s.new_mode, s.slot, s.playtime, s.fs_on, s._cl, s.slots = False, 0, 0.0, False, None, [None] * 3
+        s.mods = dict(god=False, infinite_soul=False, infinite_geo=False, unlock_all=False, one_hit=False,
+                      no_cooldowns=False, super_speed=False, super_jump=False)
+        s.mod_sel = 0
+        s.refresh_slots(); s.apply_fullscreen()
+
+    def play_sfx(s, name, volume=1.0):
+        if not getattr(s, "music_ready", False):
+            return
+        snd = getattr(s, "sfx", {}).get(name)
+        if snd is None:
+            return
+        try:
+            snd.set_volume(max(0.0, min(1.0, volume)))
+            snd.play()
+        except pygame.error:
+            pass
+
+    def play_final_boss_music(s):
+        """Start Blood Drain when entering the final-boss room."""
+        if not getattr(s, "music_ready", False):
+            s.say("Music system could not start.", 3)
+            return
+        # Build the path from the folder containing main.py so Windows can
+        # run the game from any working directory.
+        base = os.path.dirname(os.path.abspath(__file__))
+        paths = [
+            os.path.normpath(os.path.join(base, "music", "blood_drain.mp3")),
+            os.path.normpath(os.path.join(base, "music", "blood_drain.ogg")),
+        ]
+        path = next((p for p in paths if os.path.isfile(p)), None)
+        if path is None:
+            s.say("Blood Drain NOT FOUND: music/blood_drain.mp3", 5)
+            print("Blood Drain not found. Expected:", paths[0])
+            return
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.set_volume(1.0)
+            pygame.mixer.music.play(-1, fade_ms=400)
+            s.say("Blood Drain playing!", 3)
+            print("Blood Drain playing:", path)
+        except Exception as exc:
+            print("Final boss music error:", repr(exc))
+            s.say("Blood Drain found, but Pygame could not play it.", 5)
+
+    def stop_music(s):
+        if getattr(s, "music_ready", False):
+            try:
+                pygame.mixer.music.fadeout(700)
+            except pygame.error:
+                pass
+
+    def start(s, load=False):
+        s.stop_music()
+        s.p = Player()
+        s.dead, s.taken, s.shade, s.shots = set(), set(), None, []
+        s.spawn = (0, 4, 14)
+        s.visited, s.bought, s.nail_lvl, s.focus_lvl, s.soul_lvl = set(), {}, 0, 0, 0
+        s.show_map, s.talk, s.area_t = False, None, 0
+        s.charms_owned, s.equipped, s.notches = set(), [], 4
+        s.ch_sel, s.show_charms, s.ch_msg, s.ch_t = 0, False, "", 0
+        s.playtime = 0.0
+        s.shake = s.note_t = s.timer = s.cam = s.flash_t = 0
+        s.note = ""
+        if load: s.apply_save()
+        s.respawn()
+        s.state = "play"
+
+    def say(s, text, t=4):
+        s.note, s.note_t = text, t
+
+    def load_room(s, i):
+        if i != getattr(s, "ri", -1): s.area_t = 3.0
+        s.ri, s.room, s.shots = i, dict(ROOMS[i]), []
+        s.build_solids(); s.visited.add(i); s.p.cape = None
+        s.en = [Enemy(k, x, y, (i, n)) for n, (k, x, y) in enumerate(s.room["spawns"])
+                if (i, n) not in s.dead]
+        if s.room.get("name") == "The Celestial Court":
+            s.play_final_boss_music()
+        else:
+            # Only stop the special final-boss track when leaving its room.
+            if getattr(s, "music_ready", False):
+                try:
+                    if pygame.mixer.music.get_busy():
+                        pygame.mixer.music.fadeout(500)
+                except pygame.error:
+                    pass
+
+    def refresh_slots(s):
+        s.slots = [slot_info(i) for i in range(3)]
+
+    def go(s, screen):
+        s.mscreen, s.msel, s.mscroll, s.confirm = screen, 0, 0.0, None
+        s.refresh_slots()
+
+    def to_menu(s):
+        s.state, s.mreturn = "title", "main"
+        s.go("main")
+
+    def open_pause(s):
+        s.state, s.mreturn = "pause", "pause"
+        s.go("pause")
+
+    def apply_fullscreen(s):
+        want = bool(SETTINGS["fullscreen"])
+        if want != s.fs_on:
+            try: pygame.display.toggle_fullscreen()
+            except Exception: pass
+            s.fs_on = want
+
+    def menu_items(s):
+        if s.mscreen == "pause": return ["Resume", "Mod Menu", "Settings", "Controls", "Main Menu", "Quit"]
+        items = ["Start", "Saves", "Settings", "Controls", "Changelog", "Credits", "Quit"]
+        if any(s.slots): items.insert(1, "Continue")
+        return items
+
+    def settings_rows(s):
+        onoff = lambda v: "On" if v else "Off"
+        return [("Difficulty", SETTINGS["diff"]), ("Screen shake", onoff(SETTINGS["shake"])),
+                ("Vignette", onoff(SETTINGS["vignette"])), ("Show FPS", onoff(SETTINGS["fps"])),
+                ("Fullscreen", onoff(SETTINGS["fullscreen"])), ("Reset to defaults", ""), ("Back", "")]
+
+    def change_setting(s, i, d):
+        keys = ["diff", "shake", "vignette", "fps", "fullscreen"]
+        if i < 5:
+            k = keys[i]
+            if k == "diff":
+                order = ["Easy", "Normal", "Hard"]
+                SETTINGS[k] = order[(order.index(SETTINGS[k]) + d) % 3]
+            else:
+                SETTINGS[k] = not SETTINGS[k]
+                if k == "fullscreen": s.apply_fullscreen()
+        elif i == 5:
+            keep = SETTINGS["last_slot"]
+            SETTINGS.update(DEFAULT_SETTINGS); SETTINGS["last_slot"] = keep
+            s.apply_fullscreen()
+        else:
+            s.go(s.mreturn); return
+        save_settings()
+
+    def begin(s, load):
+        SETTINGS["last_slot"] = s.slot; save_settings()
+        s.start(load=load)
+
+    def menu_select(s, it):
+        origin = s.mscreen
+        if it == "Resume": s.state = "play"
+        elif it == "Main Menu": s.to_menu()
+        elif it == "Quit": pygame.quit(); sys.exit()
+        elif it == "Continue":
+            sl = SETTINGS.get("last_slot", 0)
+            if not s.slots[sl]: sl = next(i for i in range(3) if s.slots[i])
+            s.slot = sl; s.begin(True)
+        elif it == "Mod Menu":
+            s.mreturn = origin; s.mscreen = "mods"; s.msel = 0
+        else:
+            s.mreturn = origin
+            s.new_mode = it == "Start"
+            s.go({"Start": "saves", "Saves": "saves", "Settings": "settings", "Controls": "controls",
+                  "Changelog": "changelog", "Credits": "credits"}[it])
+            if it in ("Start", "Saves"): s.msel = SETTINGS.get("last_slot", 0)
+
+    def run_confirm(s):
+        kind, i = s.confirm
+        s.confirm = None
+        if kind == "delete":
+            try: os.remove(SAVE_FILES[i])
+            except OSError: pass
+            s.refresh_slots()
+        else:
+            s.slot = i; s.begin(False)
+
+    def mod_rows(s):
+        onoff = lambda v: "ON" if v else "OFF"
+        return [
+            ("Teleport to Final Boss", "", "Warp directly to The Seraph"),
+            ("God Mode", onoff(s.mods["god"]), "Take no damage"),
+            ("Infinite Soul", onoff(s.mods["infinite_soul"]), "Keep Soul at 99"),
+            ("Infinite Geo", onoff(s.mods["infinite_geo"]), "Keep Geo at 99,999"),
+            ("Unlock Everything", onoff(s.mods["unlock_all"]), "Unlock dash, wings, claw and upgrades"),
+            ("One-Hit Kill", onoff(s.mods["one_hit"]), "Normal enemies die in one slash"),
+            ("No Cooldowns", onoff(s.mods["no_cooldowns"]), "Dash and Nail recharge instantly"),
+            ("Super Speed", onoff(s.mods["super_speed"]), "Move much faster"),
+            ("Super Jump", onoff(s.mods["super_jump"]), "Jump much higher"),
+            ("Heal Full", "", "Restore all health now"),
+            ("Kill All Enemies", "", "Defeat every enemy in this room"),
+            ("Max Everything", "", "Give max health, Geo, Soul and abilities"),
+            ("Back", "", "Return to pause menu"),
+        ]
+
+    def apply_mods(s):
+        if not hasattr(s, "mods") or not hasattr(s, "p"): return
+        p = s.p
+        if s.mods["infinite_geo"]: p.geo = 99999
+        if s.mods["infinite_soul"]: p.soul = 99
+        if s.mods["unlock_all"]:
+            p.has_dash = p.has_wings = p.has_claw = True
+            p.air_jumps = max(p.air_jumps, 1)
+            s.nail_lvl = max(s.nail_lvl, 5); s.focus_lvl = max(s.focus_lvl, 1); s.soul_lvl = max(s.soul_lvl, 2)
+        if s.mods["no_cooldowns"]:
+            p.dash_cd = p.atk_cd = 0
+        if s.mods["god"]:
+            p.iframes = max(p.iframes, 0.1)
+        if s.mods["unlock_all"] and p.maxhp < 9:
+            p.maxhp = 9; p.hp = max(p.hp, p.maxhp)
+
+    def mod_action(s, i):
+        if i == 0:
+            target = next((j for j, r in enumerate(ROOMS) if r.get("name") == "The Celestial Court"), None)
+            if target is not None:
+                s.load_room(target)
+                s.p.x = 25 * T + 4
+                s.p.y = 14 * T - s.p.h
+                s.p.vx = s.p.vy = 0
+                s.p.iframes = 1.0
+                s.state = "play"
+                s.say("Teleported to the final boss.", 2)
+        elif i <= 8:
+            keys = ["god", "infinite_soul", "infinite_geo", "unlock_all", "one_hit", "no_cooldowns", "super_speed", "super_jump"]
+            k = keys[i - 1]
+            s.mods[k] = not s.mods[k]
+            s.say(k.replace("_", " ").title() + (" enabled." if s.mods[k] else " disabled."), 1.5)
+        elif i == 9:
+            s.p.hp = s.p.maxhp; s.say("Fully healed.", 1.5)
+        elif i == 10:
+            for e in list(s.en):
+                s.dead.add(e.id); s.p.geo += int(e.geo * (1.5 if s.eq("greed") else 1))
+            s.en.clear(); s.build_solids(); s.say("All enemies defeated in this room.", 2)
+        elif i == 11:
+            s.mods.update(god=True, infinite_soul=True, infinite_geo=True, unlock_all=True, no_cooldowns=True)
+            s.p.maxhp = 9; s.p.hp = 9; s.p.soul = 99; s.p.geo = 99999; s.p.has_dash = s.p.has_wings = s.p.has_claw = True
+            s.nail_lvl = 5; s.focus_lvl = 1; s.soul_lvl = 2
+            s.say("All mods enabled and player maxed out.", 2.5)
+        else:
+            s.go(s.mreturn)
+
+    def menu_input(s, pressed, dt):
+        K = pygame
+        up, down = pressed & {K.K_w, K.K_UP}, pressed & {K.K_s, K.K_DOWN}
+        left, right = pressed & {K.K_a, K.K_LEFT}, pressed & {K.K_d, K.K_RIGHT}
+        ok = pressed & {K.K_RETURN, K.K_KP_ENTER, K.K_SPACE}
+        back = pressed & {K.K_ESCAPE, K.K_BACKSPACE}
+        sc = s.mscreen
+        if s.confirm:
+            if ok: s.run_confirm()
+            elif back: s.confirm = None
+            return
+        if sc in ("main", "pause"):
+            items = s.menu_items(); n = len(items)
+            if up: s.msel = (s.msel - 1) % n
+            if down: s.msel = (s.msel + 1) % n
+            if ok: s.menu_select(items[s.msel])
+            elif back and sc == "pause": s.state = "play"
+        elif sc == "saves":
+            if up: s.msel = (s.msel - 1) % 3
+            if down: s.msel = (s.msel + 1) % 3
+            if ok:
+                s.slot = s.msel
+                if s.slots[s.msel] and s.new_mode: s.confirm = ("overwrite", s.msel)
+                else: s.begin(bool(s.slots[s.msel]))
+            elif pressed & {K.K_x, K.K_DELETE}:
+                if s.slots[s.msel]: s.confirm = ("delete", s.msel)
+            elif back: s.go(s.mreturn)
+        elif sc == "settings":
+            if up: s.msel = (s.msel - 1) % 7
+            if down: s.msel = (s.msel + 1) % 7
+            if left: s.change_setting(s.msel, -1)
+            elif right or ok: s.change_setting(s.msel, 1)
+            elif back: s.go(s.mreturn)
+        elif sc == "mods":
+            n = len(s.mod_rows())
+            if up: s.msel = (s.msel - 1) % n
+            if down: s.msel = (s.msel + 1) % n
+            if left or right or ok: s.mod_action(s.msel)
+            elif back: s.go(s.mreturn)
+            s.mscroll = max(0, min(max(0, n - 10), s.msel - 5))
+        else:
+            if sc == "changelog":
+                k = K.key.get_pressed()
+                s.mscroll += (int(bool(k[K.K_s] or k[K.K_DOWN])) - int(bool(k[K.K_w] or k[K.K_UP]))) * 420 * dt
+            if back: s.go(s.mreturn)
+
+    def draw_menu(s, overlay=False):
+        scr, A = s.scr, s.art
+        t = pygame.time.get_ticks() / 1000
+        gold, dim, white = (255, 230, 160), (150, 156, 190), (225, 228, 245)
+        if overlay:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((6, 8, 16, 222)); scr.blit(m, (0, 0))
+        else:
+            scr.blit(A["bg"], (0, 0))
+            for key, sp in (("far", 12), ("near", 24)):
+                x0 = -int(t * sp) % 1500 - 1500
+                scr.blit(A[key], (x0, 0)); scr.blit(A[key], (x0 + 1500, 0))
+            for x0, y0, ph, sp in A["spores"]:
+                pygame.draw.circle(scr, (110, 130, 175), (int((x0 + t * 8 * sp) % W),
+                                   int((y0 + math.sin(t * sp + ph) * 15 - t * 4 * sp) % H)), 1 + int(sp > 0.9))
+            scr.blit(A["vig"], (0, 0))
+        sc, sel = s.mscreen, s.msel
+        if sc in ("main", "pause"):
+            scr.blit(glow(230, (110, 130, 255)), (W // 2 - 230, 20))
+            s.text("WONDEROUS SOUL" if sc == "main" else "PAUSED", s.big, (230, 232, 250), W // 2, 60, True)
+            if sc == "main": s.text("a Hollow Knight-inspired metroidvania", s.font, dim, W // 2, 130, True)
+            for i, it in enumerate(s.menu_items()):
+                y = 185 + i * 37
+                if i == sel:
+                    pygame.draw.rect(scr, (40, 46, 84), (W // 2 - 150, y - 4, 300, 33), border_radius=8)
+                    pygame.draw.rect(scr, gold, (W // 2 - 150, y - 4, 300, 33), 2, border_radius=8)
+                s.text(it, s.font, gold if i == sel else white, W // 2, y + 1, True)
+            if sc == "pause": s.text("Progress since your last bench is not saved.", s.font, dim, W // 2, H - 80, True)
+            s.text("W/S: choose     Enter: select" + ("     Esc: resume" if sc == "pause" else ""), s.font, dim, W // 2, H - 44, True)
+            s.text("v" + VERSION, s.font, dim, W - 90, H - 44)
+        elif sc == "saves":
+            s.text("NEW GAME  -  CHOOSE A SLOT" if s.new_mode else "SAVE SLOTS", s.mid, white, W // 2, 30, True)
+            for i in range(3):
+                bx, info = pygame.Rect(110, 100 + i * 118, W - 220, 106), s.slots[i]
+                pygame.draw.rect(scr, (44, 50, 90) if i == sel else (30, 34, 58), bx, border_radius=10)
+                pygame.draw.rect(scr, gold if i == sel else (80, 90, 130), bx, 3 if i == sel else 2, border_radius=10)
+                s.text("Slot %d" % (i + 1), s.font, gold, bx.x + 18, bx.y + 8)
+                if info:
+                    s.text(info["room"], s.font, white, bx.x + 120, bx.y + 8)
+                    s.text("Masks %d     Geo %d     Abilities %d/3" % (info["hp"], info["geo"], info["abil"]), s.font, dim, bx.x + 18, bx.y + 40)
+                    s.text("Charms %d/10     Bosses %d     Explored %d%%     Time %d:%02d" % (
+                        info["charms"], info["bosses"], info["explored"], info["time"] // 3600, info["time"] % 3600 // 60),
+                        s.font, dim, bx.x + 18, bx.y + 68)
+                else:
+                    s.text("- Empty -", s.font, dim, bx.x + 120, bx.y + 8)
+                    s.text("Start a new game here.", s.font, dim, bx.x + 18, bx.y + 40)
+            s.text("Enter: " + ("new game" if s.new_mode else "load / new") + "     X: delete     Esc: back",
+                   s.font, dim, W // 2, H - 44, True)
+        elif sc == "mods":
+            s.text("MOD MENU", s.mid, white, W // 2, 24, True)
+            s.text("Game modifiers / cheats", s.font, dim, W // 2, 62, True)
+            rows = s.mod_rows()
+            max_visible = 10
+            start = int(s.mscroll)
+            visible = rows[start:start + max_visible]
+            for j, (lab, val, desc) in enumerate(visible):
+                i = start + j
+                y = 88 + j * 38
+                bx = pygame.Rect(70, y - 5, W - 140, 34)
+                if i == sel:
+                    pygame.draw.rect(scr, (44, 50, 90), bx, border_radius=7)
+                    pygame.draw.rect(scr, gold, bx, 2, border_radius=7)
+                s.text(lab, s.font, gold if i == sel else white, bx.x + 14, y)
+                if val:
+                    s.text(val, s.font, gold if i == sel else dim, bx.right - 72, y)
+                s.text("ENTER to teleport" if i == 0 else desc, s.font, dim, bx.x + 270, y)
+            if start > 0: s.text("▲ more", s.font, dim, W - 85, 72, True)
+            if start + max_visible < len(rows): s.text("▼ more", s.font, dim, W - 85, H - 48, True)
+            s.text("W/S: choose     A/D or Enter: use     Esc: back", s.font, dim, W // 2, H - 22, True)
+        elif sc == "settings":
+            s.text("SETTINGS", s.mid, white, W // 2, 30, True)
+            for i, (lab, val) in enumerate(s.settings_rows()):
+                y = 110 + i * 52
+                bx = pygame.Rect(180, y - 6, W - 360, 42)
+                if i == sel:
+                    pygame.draw.rect(scr, (44, 50, 90), bx, border_radius=8)
+                    pygame.draw.rect(scr, gold, bx, 2, border_radius=8)
+                s.text(lab, s.font, gold if i == sel else white, bx.x + 18, y)
+                if val:
+                    txt = "<  " + val + "  >"
+                    s.text(txt, s.font, gold if i == sel else dim, bx.right - 18 - s.font.size(txt)[0], y)
+            s.text("W/S: choose     A/D or Enter: change     Esc: back", s.font, dim, W // 2, H - 44, True)
+        elif sc == "controls":
+            s.text("CONTROLS", s.mid, white, W // 2, 30, True)
+            for i, (act, keys) in enumerate(CONTROLS):
+                y = 100 + i * 31
+                s.text(act, s.font, gold, 120, y)
+                s.text(keys, s.font, white, 450, y)
+            s.text("Esc: back", s.font, dim, W // 2, H - 44, True)
+        elif sc == "changelog":
+            s.text("CHANGELOG", s.mid, white, W // 2, 30, True)
+            if s._cl is None: s._cl = build_changelog(s.font)
+            view = pygame.Rect(90, 100, W - 180, H - 170)
+            s.mscroll = max(0, min(s.mscroll, max(0, len(s._cl) * 26 - view.h)))
+            scr.set_clip(view)
+            for i, (kind, text) in enumerate(s._cl):
+                s.text(text, s.font, gold if kind == "h" else white, view.x, view.y + i * 26 - int(s.mscroll))
+            scr.set_clip(None)
+            s.text("W/S: scroll     Esc: back", s.font, dim, W // 2, H - 44, True)
+        elif sc == "credits":
+            for i, ln in enumerate(CREDITS):
+                s.text(ln, s.big if i == 0 else s.font, (230, 232, 250) if i == 0 else white, W // 2, 70 + i * 36 + (30 if i else 0), True)
+            s.text("Esc: back", s.font, dim, W // 2, H - 44, True)
+        if s.confirm:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((0, 0, 0, 170)); scr.blit(m, (0, 0))
+            kind, i = s.confirm
+            box = pygame.Rect(W // 2 - 300, H // 2 - 80, 600, 160)
+            pygame.draw.rect(scr, (20, 24, 44), box, border_radius=12); pygame.draw.rect(scr, gold, box, 2, border_radius=12)
+            msg = ("Delete slot %d? This cannot be undone." % (i + 1) if kind == "delete" else
+                   "Slot %d already has a save. Start a new game here anyway?" % (i + 1))
+            for k, ln in enumerate(wrap(s.font, msg, 540)): s.text(ln, s.font, white, W // 2, box.y + 28 + k * 28, True)
+            s.text("Enter: yes     Esc: no", s.font, gold, W // 2, box.bottom - 40, True)
+
+    def eq(s, key):
+        return key in s.equipped
+
+    def notch_used(s):
+        return sum(CHARMS[k]["cost"] for k in s.equipped)
+
+    def focus_time(s):
+        ft = 0.65 if s.focus_lvl else 1.0
+        return min(ft, 0.45) if s.eq("quick_focus") else ft
+
+    def toggle_charm(s, k):
+        p = s.p
+        if k in s.equipped:
+            s.equipped.remove(k)
+            if k == "fragile_heart": p.maxhp -= 2; p.hp = min(p.hp, p.maxhp)
+        elif s.notch_used() + CHARMS[k]["cost"] <= s.notches:
+            s.equipped.append(k)
+            if k == "fragile_heart": p.maxhp += 2; p.hp += 2
+        else:
+            s.ch_msg, s.ch_t = "Not enough charm notches.", 90
+
+    def charm_input(s, pressed):
+        s.ch_t = max(0, s.ch_t - 1)
+        own = [k for k in CHARMS if k in s.charms_owned]
+        if not own: return
+        s.ch_sel %= len(own)
+        if pressed & {pygame.K_d, pygame.K_RIGHT}: s.ch_sel = (s.ch_sel + 1) % len(own)
+        if pressed & {pygame.K_a, pygame.K_LEFT}: s.ch_sel = (s.ch_sel - 1) % len(own)
+        if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE}: s.toggle_charm(own[s.ch_sel])
+
+    def save(s):
+        p = s.p
+        data = dict(spawn=list(s.spawn), geo=p.geo, maxhp=p.maxhp, dash=p.has_dash, wings=p.has_wings,
+                    claw=p.has_claw, taken=sorted(s.taken), dead=sorted(list(d) for d in s.dead if d in BOSS_IDS),
+                    bought=s.bought, nail=s.nail_lvl, focus=s.focus_lvl, soul=s.soul_lvl,
+                    visited=sorted(s.visited), shade=s.shade, charms=sorted(s.charms_owned),
+                    equipped=list(s.equipped), notches=s.notches, playtime=s.playtime)
+        try:
+            with open(SAVE_FILES[s.slot], "w") as fh: json.dump(data, fh)
+        except OSError:
+            s.say("Could not write save file.", 3)
+
+    def apply_save(s):
+        try:
+            with open(SAVE_FILES[s.slot]) as fh: d = json.load(fh)
+        except (OSError, ValueError):
+            return
+        p = s.p
+        s.spawn = tuple(d.get("spawn", s.spawn)); p.geo = d.get("geo", 0); p.maxhp = d.get("maxhp", 5)
+        p.has_dash, p.has_wings, p.has_claw = d.get("dash", False), d.get("wings", False), d.get("claw", False)
+        s.taken = set(d.get("taken", [])); s.dead = {tuple(x) for x in d.get("dead", [])}
+        s.bought = d.get("bought", {}); s.nail_lvl = d.get("nail", 0)
+        s.focus_lvl = d.get("focus", 0); s.soul_lvl = d.get("soul", 0)
+        s.visited = set(d.get("visited", [])); s.shade = d.get("shade")
+        s.charms_owned = set(d.get("charms", [])); s.equipped = list(d.get("equipped", []))
+        s.notches = d.get("notches", 4); s.playtime = d.get("playtime", 0.0)
+
+    def build_solids(s):
+        base, gt = ROOMS[s.ri], set()
+        for gx, gy, gw, gh, bid in base["gates"]:
+            if bid not in s.dead:
+                gt |= {(x, y) for x in range(gx, gx + gw) for y in range(gy, gy + gh)}
+        s.room["solid"] = base["solid"] | gt
+        s.room["gate"] = gt
+
+    def interact(s):
+        p = s.p
+        for n in s.room["npcs"]:
+            if p.rect.colliderect(npc_rect(n)):
+                s.talk = dict(npc=n, i=0, shop=False); s.state = "talk"; return
+        for d in s.room["doors"]:
+            if p.rect.colliderect(door_rect(d)):
+                s.load_room(d["to"])
+                p.x, p.y = d["tx"] * T + 4, (d["ty"] + 1) * T - p.h
+                p.vx = p.vy = 0; p.safe = (p.x, p.y); return
+        for bx, by in s.room["benches"]:
+            if p.rect.colliderect(pygame.Rect(bx * T - 8, by * T, 48, T)):
+                s.rest(); return
+
+    def talk_update(s, pressed):
+        tk = s.talk; n = tk["npc"]
+        s.note_t = max(0, s.note_t - 0.016)
+        adv = pressed & {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE, pygame.K_z,
+                         pygame.K_x, pygame.K_w, pygame.K_UP}
+        if tk["shop"]:
+            for i, (lbl, cost, key, lim) in enumerate(n["shop"]):
+                if pygame.K_1 + i in pressed: s.buy(key, cost, lim, lbl)
+            if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE}: s.state = "play"
+        elif adv:
+            if tk["i"] < len(n["lines"]) - 1: tk["i"] += 1
+            elif n.get("shop"): tk["shop"] = True
+            else: s.state = "play"
+
+    def buy(s, key, cost, lim, label):
+        p, n = s.p, s.bought.get(key, 0)
+        if n >= lim: s.say("Sold out.", 2); return
+        price = cost * (n + 1)
+        if p.geo < price: s.say("Not enough Geo.", 2); return
+        p.geo -= price; s.bought[key] = n + 1
+        if key == "mask": p.maxhp += 1; p.hp = p.maxhp
+        elif key == "nail": s.nail_lvl += 1
+        elif key == "focus": s.focus_lvl = 1
+        elif key == "soul": s.soul_lvl += 1
+        elif key.startswith("charm:"): s.charms_owned.add(key[6:])
+        s.say("Purchased: " + label, 2.5)
+
+    def respawn(s):
+        p, (ri, bx, by) = s.p, s.spawn
+        s.load_room(ri)
+        p.x, p.y = bx * T + 4, (by + 1) * T - p.h
+        p.vx = p.vy = 0
+        p.hp, p.soul, p.iframes, p.slash, p.focus = p.maxhp, 0, 1.0, None, 0
+        p.safe = (p.x, p.y)
+
+    def rest(s):
+        p = s.p
+        p.hp = p.maxhp
+        s.spawn = (s.ri, int(p.x // T), 14)
+        s.dead = {d for d in s.dead if d in BOSS_IDS}
+        s.load_room(s.ri)
+        s.save(); s.say("Rested. Progress saved.", 2.5)
+
+    def hurt(s, dmg, srcx):
+        p = s.p
+        if s.mods.get("god", False) or p.iframes > 0 or s.state != "play": return
+        p.hp -= max(1, dmg + DIFF[SETTINGS["diff"]][1])
+        s.play_sfx("hurt", 0.9)
+        p.iframes, p.knock, p.focus, p.dashing, p.slash = (2.0 if s.eq("stone_skin") else 1.3) * DIFF[SETTINGS["diff"]][2], 0.25, 0, 0, None
+        p.vx = (1 if p.x + 12 > srcx else -1) * 320
+        p.vy = -320
+        s.shake = 0.2
+        if p.hp <= 0:
+            if p.geo > 0:
+                s.shade = dict(room=s.ri, x=p.x, y=p.y, geo=p.geo)
+            p.geo = 0
+            s.state, s.timer = "dead", 2.0
+
+    def hazard(s):
+        s.hurt(1, s.p.x)
+        if s.state == "play":
+            s.p.x, s.p.y = s.p.safe
+            s.p.vx = s.p.vy = 0
+
+    def pogo(s):
+        p = s.p
+        p.vy, p.jumping, p.air_dash, p.dashing = -560, False, True, 0
+        s.play_sfx("pogo", 0.8)
+        p.air_jumps = 1
+
+    def slash_rect(s):
+        p = s.p; r = p.rect; d = p.slash["dir"]
+        ex = 16 if s.eq("long_nail") else 0
+        if d == "up": return pygame.Rect(r.centerx - 24, r.top - 52 - ex, 48, 56 + ex)
+        if d == "down": return pygame.Rect(r.centerx - 24, r.bottom - 4, 48, 56 + ex)
+        if p.face > 0: return pygame.Rect(r.right - 4, r.centery - 24, 60 + ex, 48)
+        return pygame.Rect(r.left - 56 - ex, r.centery - 24, 60 + ex, 48)
+
+    def hit_enemy(s, e, sl):
+        p = s.p
+        sl["hit"].add(id(e))
+        damage = 5 + 3 * s.nail_lvl + (3 if s.eq("heavy_nail") else 0)
+        if s.mods.get("one_hit", False) and e.kind not in BOSSES: damage = e.hp
+        e.hp -= damage; e.flash = 0.12
+        s.play_sfx("hit", 0.85)
+        p.soul = min(99, p.soul + 11 + 4 * s.soul_lvl + (6 if s.eq("soul_catch") else 0))
+        if e.kind not in HEAVY:
+            e.stun = 0.2
+            e.vx = p.face * 220 if sl["dir"] in ("l", "r") else 0
+            if e.kind == "crawl": e.vy = -150
+        if sl["dir"] == "down": s.pogo()
+        if e.hp <= 0:
+            s.en.remove(e); s.dead.add(e.id); p.geo += int(e.geo * (1.5 if s.eq("greed") else 1))
+            if e.kind in BOSSES:
+                s.say(BOSS_MSG[e.kind] + "  (+1 charm notch)", 4); s.build_solids(); s.notches = min(11, s.notches + 1)
+                if e.id == FINAL_ID: s.timer, s.flash_t = 2.5, 2.5
+
+    # ---- per-frame
+    def update(s, dt, pressed):
+        p, K = s.p, pygame
+        s.apply_mods()
+        k = pygame.key.get_pressed()
+        L, R = k[K.K_a] or k[K.K_LEFT], k[K.K_d] or k[K.K_RIGHT]
+        U, D = k[K.K_w] or k[K.K_UP], k[K.K_s] or k[K.K_DOWN]
+        jump_held = k[K.K_SPACE] or k[K.K_z]
+        dirx = int(bool(R)) - int(bool(L))
+        for a in ("iframes", "knock", "dash_cd", "atk_cd", "dashing", "wj"):
+            setattr(p, a, max(0, getattr(p, a) - dt))
+        s.shake = max(0, s.shake - dt); s.note_t = max(0, s.note_t - dt); s.area_t = max(0, s.area_t - dt); s.flash_t = max(0, s.flash_t - dt); s.playtime += dt
+
+        if pressed & {K.K_SPACE, K.K_z}: p.buf = 0.12
+        p.buf -= dt
+        p.coyote = 0.1 if p.ground else p.coyote - dt
+
+        if pressed & {K.K_f}:
+            if p.hp >= p.maxhp: s.say("Health is full.", 1.5)
+            elif p.soul < 33: s.say("Need 33 Soul to Focus. Hit enemies to gain Soul.", 2.5)
+        # Focus (hold F to convert Soul into a mask)
+        if (k[K.K_f] and p.ground and p.soul >= 33 and p.hp < p.maxhp
+                and not dirx and p.knock <= 0 and p.dashing <= 0):
+            if p.focus <= 0:
+                s.play_sfx("focus", 0.7)
+            p.focus += dt; p.vx = 0
+            if p.focus >= s.focus_time():
+                p.hp += 1; p.soul -= 33; p.focus = 0
+                s.play_sfx("heal", 0.75)
+        else:
+            p.focus = 0
+
+        if p.focus == 0 and p.knock <= 0:
+            if (pressed & {K.K_c, K.K_LSHIFT, K.K_l} and p.has_dash and p.dash_cd <= 0
+                    and (p.ground or p.air_dash)):
+                p.dashing, p.dash_cd = (0.26, 0.3) if s.eq("swift_dash") else (0.2, 0.6)
+                s.play_sfx("dash", 0.75)
+                if not p.ground: p.air_dash = False
+            if p.dashing > 0:
+                p.vx, p.vy = p.face * 820, 0
+            else:
+                if p.wj <= 0:
+                    p.vx = dirx * ((680 if s.mods.get("super_speed", False) else (340 if s.eq("wind_stride") else 290)))
+                    if dirx: p.face = dirx
+                cling = p.has_claw and not p.ground and p.wall != 0 and dirx == p.wall
+                if cling and p.vy > 90: p.vy = 90
+                if p.buf > 0 and p.coyote > 0:
+                    p.vy, p.buf, p.coyote, p.jumping = (-(1100 if s.mods.get("super_jump", False) else 720)), 0, 0, True
+                    s.play_sfx("jump", 0.8)
+                elif p.buf > 0 and cling:
+                    p.vy, p.vx, p.buf, p.jumping, p.wj = -690, -p.wall * 280, 0, True, 0.16
+                    s.play_sfx("jump", 0.72)
+                    p.face = -p.wall; p.air_dash = True; p.air_jumps = 1
+                elif p.buf > 0 and p.has_wings and p.air_jumps > 0 and not p.ground:
+                    p.vy, p.buf, p.jumping = -690, 0, True
+                    s.play_sfx("jump", 0.72)
+                    p.air_jumps -= 1
+                if p.jumping and not jump_held and p.vy < -200:
+                    p.vy, p.jumping = -200, False
+                if p.vy >= 0: p.jumping = False
+            if pressed & {K.K_x, K.K_j} and p.atk_cd <= 0:
+                d = "up" if U else "down" if (D and not p.ground) else ("r" if p.face > 0 else "l")
+                p.slash, p.atk_cd = dict(dir=d, t=0.16, hit=set()), (0.22 if s.eq("quick_slash") else 0.35)
+                s.play_sfx("slash_heavy" if s.eq("heavy_nail") else "slash", 0.9)
+
+        if not p.ground and abs(p.vy) < 140 and jump_held and p.dashing <= 0:
+            p.vy -= GRAV * dt * 0.45
+        pre_vy, was_g = p.vy, p.ground
+        p.move(s.room, dt, p.dashing <= 0)
+        if p.ground and not was_g and pre_vy > 150:
+            p.land_t, p.land_amt = 0.18, max(0.35, min(1.0, pre_vy / 650))
+        if was_g and not p.ground and p.vy < 0:
+            p.jump_t = 0.2
+        p.land_t = max(0, p.land_t - dt); p.jump_t = max(0, p.jump_t - dt)
+        if p.ground and abs(p.vx) > 20:
+            p.walk_t += dt * 13
+            # Play exactly one footstep at each leg cycle, rather than every frame.
+            step_cycle = int(p.walk_t / math.pi)
+            if step_cycle != p.last_step_cycle:
+                p.last_step_cycle = step_cycle
+                s.play_sfx("step", 0.52)
+        update_cape(p, dt, pygame.time.get_ticks() / 1000)
+        if p.ground:
+            p.air_dash = True; p.air_jumps = 1
+            p.safe = (p.x, p.y)
+
+        # nail slash
+        if p.slash:
+            sl = p.slash; sl["t"] -= dt
+            r = s.slash_rect()
+            for e in list(s.en):
+                if id(e) not in sl["hit"] and r.colliderect(e.rect): s.hit_enemy(e, sl)
+                elif e.kind == "seraph" and id(e) not in sl["hit"] and e.state == "fight":
+                    for hd in e.hands:
+                        if hd["state"] == "rest" and r.colliderect(pygame.Rect(int(hd["x"]) - 75, int(hd["y"]), 150, 170)):
+                            s.hit_enemy(e, sl); break
+            if sl["dir"] == "down" and "pogo" not in sl:
+                for cx, cy in s.room["spikes"]:
+                    if r.colliderect(pygame.Rect(cx * T, cy * T, T, T)):
+                        sl["pogo"] = True; s.pogo(); break
+            sh = s.shade
+            if sh and sh["room"] == s.ri and "shade" not in sl and \
+                    r.colliderect(pygame.Rect(sh["x"], sh["y"], 24, 44)):
+                p.geo += sh["geo"]; s.shade = None; sl["shade"] = True
+                s.say("Your Geo returns to you.", 2.5)
+            if sl["t"] <= 0: p.slash = None
+
+        # enemies, shots, hazards
+        for e in s.en:
+            e.update(s, dt)
+            if p.rect.colliderect(e.rect.inflate(-6, -6)): s.hurt(e.dmg, e.x + e.w / 2)
+        for sh in list(s.shots):
+            if sh[5] == "spit": sh[4] += 700 * dt
+            sh[0] += sh[2] * dt; sh[1] += sh[4] * dt; sh[3] -= dt
+            if sh[5] == "wave": r = pygame.Rect(int(sh[0]) - 15, int(sh[1]), 30, 22)
+            else: r = pygame.Rect(int(sh[0]) - 8, int(sh[1]) - 8, 16, 16)
+            if sh[3] <= 0 or solids(s.room, r.inflate(-6, -6)): s.shots.remove(sh)
+            elif p.rect.colliderect(r):
+                s.hurt(1, sh[0])
+                if sh[5] != "wave": s.shots.remove(sh)
+        for cx, cy in s.room["spikes"]:
+            if p.rect.colliderect(pygame.Rect(cx * T + 4, cy * T + T // 2, T - 8, T // 2)):
+                s.hazard(); break
+        if p.y > H + 64: s.hazard()
+
+        # items & benches
+        for name, ix, iy in s.room["items"]:
+            if name not in s.taken and p.rect.colliderect(pygame.Rect(ix * T, iy * T, T, T)):
+                s.taken.add(name); kd = name.split(":")[0].rstrip("0123456789")
+                if kd == "charm":
+                    ck = name.split(":")[1]; s.charms_owned.add(ck)
+                    s.say("Charm found: " + CHARMS[ck]["name"] + "!  Press I to equip it.", 6)
+                    continue
+                if kd == "cloak": p.has_dash = True
+                elif kd == "wings": p.has_wings = True
+                elif kd == "claw": p.has_claw = True
+                elif kd == "mask": p.maxhp += 1; p.hp = p.maxhp
+                elif kd == "geocache": p.geo += 150
+                s.say(ITEM_MSG[kd], 6)
+        if pressed & {K.K_w, K.K_UP}: s.interact()
+
+        # room transitions
+        cx = p.x + p.w / 2
+        if cx < 0 and (s.ri, "L") in LINKS:
+            s.load_room(LINKS[(s.ri, "L")]); p.x = s.room["w"] * T - 40
+        elif cx > s.room["w"] * T and (s.ri, "R") in LINKS:
+            s.load_room(LINKS[(s.ri, "R")]); p.x = 8
+        s.cam = max(0, min(p.rect.centerx - W // 2, s.room["w"] * T - W))
+
+        if FINAL_ID in s.dead and s.timer > 0:
+            s.timer -= dt
+            if s.timer <= 0:
+                s.stop_music()
+                s.state = "win"
+
+    # ---- drawing
+    def draw(s):
+        scr, A = s.scr, s.art
+        t = pygame.time.get_ticks() / 1000
+        scr.blit(A["bg"], (0, 0))
+        if s.state == "title":
+            s.draw_menu(); return
+        shx = random.randint(-4, 4) if s.shake > 0 and SETTINGS["shake"] else 0
+        cam, p = int(s.cam), s.p
+        ox = -cam + shx
+        for key, fac in (("far", 0.2), ("near", 0.45)):
+            lw = A[key].get_width()
+            x0 = -int(cam * fac) % lw - lw
+            scr.blit(A[key], (x0, 0)); scr.blit(A[key], (x0 + lw, 0))
+        for x0, y0, ph, sp in A["spores"]:
+            sx = (x0 + t * 8 * sp - cam * 0.6) % W
+            sy = (y0 + math.sin(t * sp + ph) * 15 - t * 4 * sp) % H
+            pygame.draw.circle(scr, (110, 130, 175), (int(sx), int(sy)), 1 + int(sp > 0.9))
+        for e in s.en:
+            if e.kind == "seraph": draw_seraph_bg(scr, e, cam, t)
+        sol = s.room["solid"]
+        for cx, cy in sol:
+            x, y = cx * T + ox, cy * T
+            if -T < x < W:
+                v = (cx * 7 + cy * 13) % 6
+                if cy > 0 and (cx, cy - 1) not in sol:
+                    scr.blit(A["top"][v], (x, y - 8))
+                else:
+                    scr.blit(A["stone"][v], (x, y))
+                if cy < 16 and (cx, cy + 1) not in sol:
+                    pygame.draw.line(scr, (22, 24, 40), (x, y + T - 2), (x + T, y + T - 2), 3)
+                if (cx, cy) in s.room["gate"]:
+                    pygame.draw.rect(scr, (170, 50, 70), (x, y, T, T), 3)
+                    pygame.draw.line(scr, (170, 50, 70), (x + 4, y + 4), (x + T - 4, y + T - 4), 2)
+        if s.ri not in s.props:
+            s.props[s.ri] = build_props(s.room, s.ri)
+        for kind, px, py, pv in s.props[s.ri]:
+            if -40 < px + ox < W + 40:
+                draw_prop(scr, kind, px + ox, py, pv, t)
+        for cx, cy in s.room["spikes"]:
+            x = cx * T + ox
+            for j in range(3):
+                b = x + j * 11
+                pygame.draw.polygon(scr, (120, 50, 62), [(b, cy * T + T), (b + 5, cy * T + 6), (b + 11, cy * T + T)])
+                pygame.draw.polygon(scr, (205, 80, 92), [(b + 1, cy * T + T), (b + 5, cy * T + 6), (b + 6, cy * T + T)])
+        for bx, by in s.room["benches"]:
+            x = bx * T + ox
+            pygame.draw.rect(scr, (120, 95, 70), (x - 8, by * T + 14, 48, 8), border_radius=2)
+            pygame.draw.line(scr, (150, 122, 92), (x - 8, by * T + 15), (x + 40, by * T + 15), 1)
+            pygame.draw.rect(scr, (90, 70, 55), (x - 4, by * T + 22, 6, 10))
+            pygame.draw.rect(scr, (90, 70, 55), (x + 30, by * T + 22, 6, 10))
+            pygame.draw.rect(scr, (120, 95, 70), (x - 8, by * T + 2, 6, 14))
+            pygame.draw.line(scr, (70, 70, 90), (x + 44, by * T + 32), (x + 44, by * T - 20), 3)
+            scr.blit(glow(46, (255, 190, 110)), (x + 44 - 46, by * T - 22 - 46))
+            pygame.draw.circle(scr, (255, 226, 160), (x + 44, by * T - 22), 5)
+        for name, ix, iy in s.room["items"]:
+            if name not in s.taken:
+                mx, my = ix * T + ox + 16, iy * T + 16 + math.sin(t * 3) * 4
+                ic = ICON[name.split(":")[0].rstrip("0123456789")]
+                scr.blit(glow(40, ic), (mx - 40, my - 40))
+                pygame.draw.polygon(scr, ic, [(mx, my - 14), (mx + 14, my), (mx, my + 14), (mx - 14, my)])
+                pygame.draw.polygon(scr, (210, 245, 255), [(mx, my - 14), (mx + 6, my - 2), (mx, my + 2), (mx - 6, my - 2)])
+        sh = s.shade
+        if sh and sh["room"] == s.ri:
+            sx, sy = sh["x"] + ox, sh["y"] + math.sin(t * 3) * 3
+            scr.blit(glow(40, (120, 130, 220)), (sx + 12 - 40, sy + 22 - 40))
+            ss = pygame.Surface((24, 44), pygame.SRCALPHA)
+            pygame.draw.ellipse(ss, (20, 20, 40, 200), (0, 0, 24, 44))
+            pygame.draw.ellipse(ss, (140, 150, 230, 230), (0, 0, 24, 44), 2)
+            pygame.draw.circle(ss, (255, 255, 255, 230), (8, 16), 2); pygame.draw.circle(ss, (255, 255, 255, 230), (16, 16), 2)
+            scr.blit(ss, (sx, sy))
+        for d in s.room["doors"]:
+            draw_door(scr, d, ox, t)
+            if s.state == "play" and p.rect.colliderect(door_rect(d)):
+                s.text("W", s.font, (190, 225, 255), d["x"] * T + ox + 10, (d["y"] - 1) * T - 26)
+        for n in s.room["npcs"]:
+            draw_npc(scr, n, ox, t, p.x)
+            if s.state == "play" and p.rect.colliderect(npc_rect(n)):
+                s.text("W", s.font, (255, 230, 160), n["x"] * T + ox + 10, (n["y"] + 1) * T - 96)
+        for e in s.en:
+            DRAWERS[e.kind](scr, e, ox, t)
+        for x, y, vx, life, vy, kind in s.shots:
+            if kind != "wave":
+                sx, yy = int(x) + ox, int(y)
+                gc = (170, 240, 130) if kind == "spit" else ((255, 225, 120) if kind == "holy" else (190, 130, 255))
+                scr.blit(glow(20, gc), (sx - 20, yy - 20))
+                pygame.draw.circle(scr, shade(gc, 50), (sx, yy), 6)
+                pygame.draw.circle(scr, (255, 255, 255), (sx - 2, yy - 2), 2)
+                continue
+            y = int(y)
+            sx, d = int(x) + ox, (1 if vx > 0 else -1)
+            scr.blit(glow(26, (255, 150, 60)), (sx - 26, y - 4))
+            pygame.draw.polygon(scr, (200, 120, 50), [(sx - d * 14, y + 22), (sx - d * 6, y + 8), (sx + d * 2, y + 14),
+                                                      (sx + d * 10, y), (sx + d * 16, y + 22)])
+            pygame.draw.polygon(scr, (255, 200, 110), [(sx - d * 6, y + 22), (sx, y + 12), (sx + d * 8, y + 22)])
+        if s.state in ("play", "talk", "pause") and (p.iframes <= 0 or int(p.iframes * 20) % 2):
+            r = p.rect.move(ox, 0)
+            if p.focus > 0:
+                scr.blit(glow(46, (150, 200, 255)), (r.centerx - 46, r.centery - 46))
+                pygame.draw.circle(scr, (150, 200, 255), r.center, 28 + int(math.sin(p.focus * 30) * 3), 2)
+            draw_player(scr, p, ox, t)
+            if p.dashing > 0:
+                pygame.draw.line(scr, (140, 200, 255), (r.centerx - p.face * 44, r.centery), r.center, 4)
+        if p.slash:
+            sr = s.slash_rect().move(ox, 0)
+            a0 = {"r": -1.0, "l": math.pi - 1.0, "up": math.pi / 2 - 1.0, "down": -math.pi / 2 - 1.0}[p.slash["dir"]]
+            pygame.draw.arc(scr, (255, 255, 255), sr, a0, a0 + 2.0, 6)
+            pygame.draw.arc(scr, (190, 215, 255), sr.inflate(-10, -10), a0, a0 + 2.0, 3)
+        tn = s.room.get("tint")
+        if tn:
+            tc = s.__dict__.setdefault("_tints", {})
+            if tn not in tc:
+                ov = pygame.Surface((W, H), pygame.SRCALPHA); ov.fill((*tn, 34)); tc[tn] = ov
+            scr.blit(tc[tn], (0, 0))
+        if SETTINGS["vignette"]: scr.blit(A["vig"], (0, 0))
+        # HUD
+        for i in range(p.maxhp):
+            c = (240, 240, 250) if i < p.hp else (70, 70, 90)
+            pygame.draw.circle(scr, c, (34 + i * 30, 30), 11, 0 if i < p.hp else 2)
+        pygame.draw.circle(scr, (60, 70, 100), (34, 84), 22, 2)
+        scr.set_clip(pygame.Rect(0, 62 + int(44 * (1 - p.soul / 99)), W, 44))
+        pygame.draw.circle(scr, (190, 220, 255) if p.soul >= 33 else (110, 140, 190), (34, 84), 20)
+        scr.set_clip(None)
+        pygame.draw.circle(scr, (240, 200, 90), (78, 84), 8)
+        s.text(str(p.geo), s.font, (240, 220, 150), 94, 74)
+        b = next((e for e in s.en if e.kind in BOSSES), None)
+        if b:
+            pygame.draw.rect(scr, (60, 30, 30), (W // 2 - 200, H - 30, 400, 10))
+            pygame.draw.rect(scr, (220, 220, 230), (W // 2 - 200, H - 30, 400 * b.hp / b.maxhp, 10))
+            s.text(BOSS_NAME[b.kind], s.font, (200, 200, 215), W // 2, H - 56, True)
+        if s.note_t > 0:
+            s.text(s.note, s.font, (255, 255, 255), W // 2, 40, True)
+        if s.area_t > 0 and s.state == "play":
+            s.text(s.room["name"], s.big, (215, 220, 240), W // 2, H // 2 - 220, True)
+        if s.state == "talk":
+            tk = s.talk; n = tk["npc"]
+            box = pygame.Rect(60, H - 230, W - 120, 200)
+            pygame.draw.rect(scr, (14, 16, 30), box, border_radius=10)
+            pygame.draw.rect(scr, (140, 150, 190), box, 2, border_radius=10)
+            s.text(n["name"], s.font, (255, 230, 160), box.x + 18, box.y + 12)
+            if not tk["shop"]:
+                for k, ln in enumerate(wrap(s.font, n["lines"][tk["i"]], box.w - 40)):
+                    s.text(ln, s.font, (220, 224, 240), box.x + 18, box.y + 44 + k * 26)
+                s.text("Enter / Space  >", s.font, (130, 140, 180), box.right - 170, box.bottom - 30)
+            else:
+                for k, (lbl, cost, key, lim) in enumerate(n["shop"]):
+                    bn = s.bought.get(key, 0)
+                    price = "SOLD OUT" if bn >= lim else str(cost * (bn + 1)) + " Geo"
+                    s.text(str(k + 1) + ")  " + lbl + "  -  " + price, s.font, (220, 224, 240), box.x + 18, box.y + 44 + k * 30)
+                s.text("Your Geo: " + str(p.geo) + "     Press 1-" + str(len(n["shop"])) + " to buy,  Enter to leave",
+                       s.font, (130, 140, 180), box.x + 18, box.bottom - 34)
+        if s.show_charms:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((6, 8, 16, 238)); scr.blit(m, (0, 0))
+            used = s.notch_used()
+            s.text("CHARMS     I: close    A/D: choose    Enter: equip / unequip", s.font, (215, 220, 240), W // 2, 40, True)
+            for i in range(s.notches):
+                pygame.draw.circle(scr, (255, 200, 120) if i < used else (80, 84, 110),
+                                   (W // 2 - s.notches * 14 + i * 28 + 14, 92), 9, 0 if i < used else 2)
+            own = [k for k in CHARMS if k in s.charms_owned]
+            if not own:
+                s.text("You have not found any charms yet.", s.font, (170, 175, 200), W // 2, 260, True)
+            for i, k in enumerate(own):
+                cx_, cy_ = 110 + (i % 5) * 160, 180 + (i // 5) * 125
+                on = k in s.equipped
+                bx = pygame.Rect(cx_ - 58, cy_ - 42, 116, 100)
+                pygame.draw.rect(scr, (60, 50, 90) if on else (30, 34, 54), bx, border_radius=10)
+                pygame.draw.rect(scr, (255, 230, 140) if i == s.ch_sel % len(own) else (90, 100, 140), bx, 3, border_radius=10)
+                scr.blit(glow(30, (255, 170, 230) if on else (120, 130, 190)), (cx_ - 30, cy_ - 52))
+                pygame.draw.polygon(scr, (255, 190, 235) if on else (150, 160, 210),
+                                    [(cx_, cy_ - 24), (cx_ + 14, cy_ - 8), (cx_, cy_ + 10), (cx_ - 14, cy_ - 8)])
+                s.text(str(CHARMS[k]["cost"]), s.font, (255, 210, 130), bx.x + 8, bx.y + 4)
+                for j, ln in enumerate(wrap(s.font, CHARMS[k]["name"], 104)[:2]):
+                    s.text(ln, s.font, (220, 224, 240), cx_ - s.font.size(ln)[0] // 2, cy_ + 14 + j * 20)
+            if own:
+                k = own[s.ch_sel % len(own)]
+                s.text(CHARMS[k]["name"] + "  -  " + CHARMS[k]["desc"], s.font, (255, 230, 160), W // 2, H - 130, True)
+            if s.ch_t > 0:
+                s.text(s.ch_msg, s.font, (255, 140, 140), W // 2, H - 90, True)
+        if s.show_map:
+            m = pygame.Surface((W, H), pygame.SRCALPHA); m.fill((6, 8, 16, 235)); scr.blit(m, (0, 0))
+            cw = min(82, (W - 80) // (max(q[0] for q in MAP_POS) + 1)); ch = int(cw * 0.6)
+            rc_ = lambda i: pygame.Rect(40 + MAP_POS[i][0] * cw, 170 + MAP_POS[i][1] * (ch + 14), cw - 8, ch)
+            for (a_, side), b_ in LINKS.items():
+                if side == "R": pygame.draw.line(scr, (90, 100, 150), rc_(a_).center, rc_(b_).center, 3)
+            for i_, rm in enumerate(ROOMS):
+                for d in rm["doors"]: pygame.draw.line(scr, (70, 110, 150), rc_(i_).center, rc_(d["to"]).center, 2)
+            for i_ in range(len(ROOMS)):
+                rc = rc_(i_); seen = i_ in s.visited
+                pygame.draw.rect(scr, (70, 80, 120) if seen else (28, 32, 50), rc, border_radius=5)
+                if i_ == s.ri: pygame.draw.rect(scr, (255, 230, 140), rc, 3, border_radius=5)
+                if seen and cw >= 60: s.text(str(i_), s.font, (230, 235, 250), rc.centerx - 6, rc.y + 4)
+            s.text("WORLD MAP   (M to close)", s.font, (215, 220, 240), W // 2, 90, True)
+            s.text("You are in: " + s.room["name"], s.font, (255, 230, 160), W // 2, 130, True)
+        if s.state == "pause": s.draw_menu(True)
+        if SETTINGS["fps"]: s.text(str(int(s.clock.get_fps())) + " FPS", s.font, (150, 160, 190), W - 90, 8)
+        if s.flash_t > 0:
+            fo = pygame.Surface((W, H)); fo.fill((255, 250, 235))
+            fo.set_alpha(int(255 * (1 - s.flash_t / 2.5))); scr.blit(fo, (0, 0))
+        if s.state == "dead":
+            v = pygame.Surface((W, H)); v.set_alpha(int(255 * min(1, (2 - s.timer) / 1.2)))
+            scr.blit(v, (0, 0))
+            s.text("You have fallen...", s.big, (200, 200, 220), W // 2, H // 2 - 30, True)
+        if s.state == "win":
+            scr.fill((10, 10, 20))
+            s.text("The Seraph has returned to the light.", s.big, (230, 230, 245), W // 2, 200, True)
+            s.text(f"Geo collected: {s.p.geo}     Press ENTER for the main menu", s.font, (170, 175, 200), W // 2, 290, True)
+
+    def text(s, t, f, c, x, y, center=False):
+        im = f.render(t, True, c)
+        s.scr.blit(im, im.get_rect(midtop=(x, y)) if center else (x, y))
+
+    def run(s):
+        while True:
+            dt = min(s.clock.tick(60) / 1000, 1 / 30)
+            pressed = set()
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    s.stop_music()
+                    pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN: pressed.add(ev.key)
+            st = s.state
+            if st == "play" and pygame.K_F2 in pressed:
+                s.open_pause(); s.mscreen, s.msel = "mods", 0
+            elif st in ("title", "pause"):
+                s.menu_input(pressed, dt)
+            elif st == "win":
+                if pressed & {pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_ESCAPE}: s.to_menu()
+            elif st == "talk":
+                if pygame.K_ESCAPE in pressed: s.state = "play"
+                else: s.talk_update(pressed)
+            elif st == "play":
+                if pygame.K_ESCAPE in pressed:
+                    if s.show_map or s.show_charms: s.show_map = s.show_charms = False
+                    else: s.open_pause()
+                else:
+                    if pygame.K_m in pressed: s.show_map = not s.show_map; s.show_charms = False
+                    if pygame.K_i in pressed: s.show_charms = not s.show_charms; s.show_map = False
+                    if s.show_charms: s.charm_input(pressed)
+                    elif not s.show_map: s.update(dt, pressed)
+            elif st == "dead":
+                s.timer -= dt
+                if s.timer <= 0: s.respawn(); s.state = "play"
+            s.draw()
+            pygame.display.flip()
+
+
+if __name__ == "__main__":
+    Game().run()
